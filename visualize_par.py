@@ -287,7 +287,7 @@ def create_animated_plot(par_data: npt.NDArray[np.float32], metadata: dict[str, 
                        vmin=float(vmin), vmax=float(vmax), cmap="plasma", shading="auto")
     
     # Add colorbar
-    cbar = plt.colorbar(im, ax=ax, label="PAR (W/m²)")
+    plt.colorbar(im, ax=ax, label="PAR (W/m²)")
     
     # Set labels and title
     ax.set_xlabel("Longitude (°)")
@@ -326,10 +326,7 @@ def create_animated_plot(par_data: npt.NDArray[np.float32], metadata: dict[str, 
     return output_file
 
 
-def main():
-    """
-    Main function to execute the PAR visualization script.
-    """
+def main() -> int:
     print("NASA GeoNEX PAR Data Visualization Script")
     print("=" * 50)
 
@@ -338,7 +335,8 @@ def main():
     par_data = load_par_data(input_path)
     metadata = parse_filename(input_path.name)
     create_animated_plot(par_data, metadata, output_path)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
