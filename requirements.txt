@@ -2,4 +2,5 @@ cartopy
 h5py
 matplotlib
 numpy
+pillow
 pyhdf

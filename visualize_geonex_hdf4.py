@@ -271,6 +271,8 @@ def process_hdf_file(
             mask = None
         
         f.end()
+
+        print(f"data range, red {np.nanmin(data_r)} - {np.nanmax(data_r)}, green {np.nanmin(data_g)} - {np.nanmax(data_g)}, blue {np.nanmin(data_b)} - {np.nanmax(data_b)}")
         
         # Scale RGB values for visualization
         data_rgb = scale_rgb(data_r, data_g, data_b, width, height, max_scale)
