@@ -226,13 +226,19 @@ def process_hdf_file(
                 
                 # Extract bands
                 data_r = data[1, :, :].astype("u2")  # Band 2 (0.64 micron)
+                data_r = np.where(data_r < -100, np.nan, data_r)
+                data_r = np.where(data_r > 16000, np.nan, data_r)
                 data_b = data[0, :, :].astype("u2")  # Band 1 (0.47 micron)
+                data_b = np.where(data_b < -100, np.nan, data_b)
+                data_b = np.where(data_b > 16000, np.nan, data_b)
                 
                 # Create green band using a weighted combination
                 # Band 3 is NIR (0.86 micron)
                 data_g = (0.48358168*data[1, :, :] + 
                           0.45706946*data[0, :, :] + 
                           0.06038137*data[2, :, :]).astype("u2")
+                data_g = np.where(data_g < -100, np.nan, data_g)
+                data_g = np.where(data_g > 16000, np.nan, data_g)
             else:
                 raise ValueError(f"Unexpected shape for reflectance data: {data.shape}")
         else:
@@ -272,10 +278,15 @@ def process_hdf_file(
         
         f.end()
 
-        print(f"data range, red {np.nanmin(data_r)} - {np.nanmax(data_r)}, green {np.nanmin(data_g)} - {np.nanmax(data_g)}, blue {np.nanmin(data_b)} - {np.nanmax(data_b)}")
+        """
+        print("reflectance data ranges")
+        print(f"red {np.nanmin(data_r)} to {np.nanmax(data_r)}")
+        print(f"green {np.nanmin(data_g)} to {np.nanmax(data_g)}")
+        print(f"blue {np.nanmin(data_b)} to {np.nanmax(data_b)}")
+        """
         
         # Scale RGB values for visualization
-        data_rgb = scale_rgb(data_r, data_g, data_b, width, height, max_scale)
+        data_rgb = scale_rgb(data_r, data_g, data_b, width, height, 3000)
         
         # Create output directory if it doesn't exist
         output_path = Path(output_file)

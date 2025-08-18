@@ -273,7 +273,7 @@ def scale_rgb(
         data_b: npt.NDArray,
         width: int,
         height: int,
-        max_scale: float = 1.0
+        max_scale: float = 0.7
     ) -> npt.NDArray[np.uint8]:
     """
     Apply logarithmic stretch to match human visual sensibility
@@ -299,7 +299,6 @@ def scale_rgb(
     x = np.clip(data_r, 1e-4, max_in).astype("f4")  # 1 will be zero in logarithm
     x = (np.log(x) - np.log(ref)) * scale + offset  
     x = np.clip(x, 0, max_out)
-
     data_rgb[:, :, 0] = x.reshape(height, width).astype("u1")
    
     # Process green channel
@@ -309,22 +308,26 @@ def scale_rgb(
     data_rgb[:, :, 1] = x.reshape(height, width).astype("u1")
    
     # Process blue channel
-    x = np.clip(data_b, 1e-4, max_in).astype("f4")
-    x = (np.log(x) - np.log(ref)) * scale + offset
+    x = np.clip(data_b, 1e-4, 0.3).astype("f4")
+    x = (np.log(x) - np.log(0.3 * 0.2)) * scale + offset
     x = np.clip(x, 0, max_out)
     data_rgb[:, :, 2] = x.reshape(height, width).astype("u1")
 
     return data_rgb
 
 
-def numpy_to_rgb_png(array_data, nodata_value=-32767):
+def numpy_to_rgb_png(array_data: npt.NDArray[np.float32], quantize: bool = False, nodata_value: int = -32767):
     """
     Convert a multi-band numpy array to RGBA PNG with transparency for nodata values.
     For float data, normalization is done based on min and max values across the selected bands.
     
-    Parameters:
-    array_data: numpy array with shape (bands, height, width)
-    nodata_value: value to be treated as transparent in any band
+    Args:
+        array_data (npt.NDArray[np.float32]): numpy array with shape (bands, height, width)
+        quantize (bool): Flag to scale data per band
+        nodata_value (int): value to be treated as transparent in any band
+    
+    Returns:
+        PIL Image
     """
     # Extract the bands for RGB
     rawr = array_data[2, :, :]
@@ -333,12 +336,11 @@ def numpy_to_rgb_png(array_data, nodata_value=-32767):
             0.06038137*array_data[3, :, :])
     rawb = array_data[0, :, :]
 
-    """
     print("reflectance data ranges")
     print(f"red {np.nanmin(rawr)} to {np.nanmax(rawr)}")
-    print(f"green {np.nanmin(rawg)} - {np.nanmax(rawg)}")
-    print(f"blue {np.nanmin(rawb)} - {np.nanmax(rawb)}")
-    """
+    print(f"green {np.nanmin(rawg)} to {np.nanmax(rawg)}")
+    print(f"blue {np.nanmin(rawb)} to {np.nanmax(rawb)}")
+
     # Create alpha channel (fully opaque by default)
     alpha = np.ones_like(rawr) * 255
     
@@ -351,8 +353,7 @@ def numpy_to_rgb_png(array_data, nodata_value=-32767):
     r = rgb[:, :, 0]
     g = rgb[:, :, 1]
     b = rgb[:, :, 2]
-    
-    quantize = False
+
     if (array_data.dtype == np.float32 or array_data.dtype == np.float64) and quantize:
         # Find global min and max across all three bands, ignoring nodata values
         combined = np.stack([r, g, b])
@@ -422,10 +423,10 @@ def main() -> int:
     if args.output:
         outfile = args.output
     else:
-        data_datetime = os.path.basename(args.input_refl).split("_")[2]
+        data_datetime = os.path.basename(args.input_refl).split("_")[8]
         data_date = data_datetime[0:7]
         data_time = data_datetime[7:11]
-        data_cell = os.path.basename(args.input_refl).split("_")[4]
+        data_cell = os.path.basename(args.input_refl).split("_")[3]
         outfile = f"GO16_ABI_RTLS_{data_date}_{data_time}_{data_cell}.png"
     rgb_image.save(outfile)
 
