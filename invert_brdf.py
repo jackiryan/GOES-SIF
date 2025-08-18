@@ -423,10 +423,10 @@ def main() -> int:
     if args.output:
         outfile = args.output
     else:
-        data_datetime = os.path.basename(args.input_refl).split("_")[8]
+        data_datetime = os.path.basename(args.input_refl).split("_")[2]
         data_date = data_datetime[0:7]
         data_time = data_datetime[7:11]
-        data_cell = os.path.basename(args.input_refl).split("_")[3]
+        data_cell = os.path.basename(args.input_refl).split("_")[4]
         outfile = f"GO16_ABI_RTLS_{data_date}_{data_time}_{data_cell}.png"
     rgb_image.save(outfile)
 

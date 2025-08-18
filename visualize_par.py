@@ -93,6 +93,12 @@ def parse_filename(filename: str) -> dict[str, str | int]:
     """
     # Remove .h5 extension and parse components
     basename = Path(filename).stem
+    print(len(basename))
+    if len(basename) > 23:
+        # Sometimes these files have non-standard filenames, but the end part
+        # matches the convention
+        basename = basename[-23:]
+    print(basename)
     
     # Pattern to match GeoNEX filename format
     pattern = r"([A-Z0-9]+)_([A-Z]+)_(\d{7})_h(\d+)v(\d+)"
@@ -302,10 +308,10 @@ def create_animated_plot(par_data: npt.NDArray[np.float32], metadata: dict[str, 
     def animate(frame):
         """Animation function for each frame (hour)."""
         real_frame = frame + int(metadata["sunrise_hr"]) + 1
-        im.set_array(par_data[real_frame].ravel())
+        im.set_array(par_data[real_frame % 24].ravel())
         
         # Update title with current hour
-        title.set_text(f"{title_base}\nHour: {real_frame:02d} UTC")
+        title.set_text(f"{title_base}\nHour: {(real_frame % 24):02d} UTC")
         
         return [im, title]
     

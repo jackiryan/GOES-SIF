@@ -38,7 +38,7 @@ Examples:
     args = parser.parse_args()
     
     # Validate inputs
-    if args.year < 1900 or args.year > 2100:
+    if args.year < 2000 or args.year > 2100:
         parser.error(f"Invalid year: {args.year}")
     
     # Ensure day of year is zero-padded
@@ -227,7 +227,7 @@ def main():
             print(f"Failed downloads: {failed} files", file=sys.stderr)
         print(f"Output directory: {output_base}")
     
-    return 0 if failed == 0 else 1
+    return 0
 
 
 if __name__ == "__main__":
