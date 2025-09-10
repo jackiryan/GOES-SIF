@@ -76,7 +76,11 @@ def vectorize_dt(dt: xr.DataTree) -> npt.NDArray[np.float32]:
     return vectorized_data
 
 
-def process_1day_matrix(data_day: datetime, data_dir: str, engine: str) -> npt.NDArray[np.float32]:
+def process_1day_matrix(
+        data_day: datetime,
+        data_dir: str,
+        engine: str
+) -> npt.NDArray[np.float32]:
     year = data_day.year
     month = f"{int(data_day.month):02d}"
     day = f"{int(data_day.day):02d}"
@@ -96,6 +100,27 @@ def process_1day_matrix(data_day: datetime, data_dir: str, engine: str) -> npt.N
             dt.close() # type: ignore
         print(f"Unexpected {type(e)} when processing granule for {data_day.strftime('%Y-%m-%d')}: {e}. Skipping...")
         return np.empty((4, 0), dtype=np.float32)
+
+
+def latlon_to_geonex_grid(
+        lats: npt.NDArray[np.float32],
+        lons: npt.NDArray[np.float32]
+) -> tuple[npt.NDArray[np.int_], npt.NDArray[np.int_]]:
+    h_ndx = np.floor((lons + 180) / 6).astype(int)
+    v_ndx = np.floor((60 - lats) / 6).astype(int)
+    # In practice this isn't necessary since data is only over the CONUS
+    h_ndx = np.clip(h_ndx, 0, 59)
+    v_ndx = np.clip(v_ndx, 0, 19)
+    return (h_ndx, v_ndx)
+
+
+def find_geonex_tiles(vectorized_data: npt.NDArray[np.float32], date: datetime) -> list[tuple[str, datetime]]:
+    lons = vectorized_data[1, :]
+    lats = vectorized_data[2, :]
+    h_ndx, v_ndx = latlon_to_geonex_grid(lats, lons)
+    tiles = [f"h{h_val:02d}v{v_val:02d}" for h_val, v_val in zip(h_ndx, v_ndx)]
+    uniq_tiles = list(set(tiles))
+    return [(tile, date) for tile in uniq_tiles]
         
         
 def main() -> int:
@@ -109,13 +134,19 @@ def main() -> int:
     end_date = datetime(year, month, num_days)
     dates = generate_dates(start_date, end_date)
     daily_data: list[npt.NDArray] = []
+    all_tiles: list[tuple[str, datetime]] = []
     for date in dates:
         daily_data.append(process_1day_matrix(date, data_dir, engine))
+        if len(daily_data[-1]) > 0:
+            all_tiles.extend(find_geonex_tiles(daily_data[-1], date))
     combined_data = np.hstack(daily_data)
     data_transposed = combined_data.T
     columns = ["hour", "longitude", "latitude", "sif_740nm"]
     df = pd.DataFrame(data_transposed, columns=columns)
     df.to_csv(output_csv, index=False)
+    print("All tiles to download:")
+    for tile in all_tiles:
+        print(f"{tile[1].strftime('%Y-%m-%d')}: {tile[0]}")
     return 0
 
 if __name__ == "__main__":
