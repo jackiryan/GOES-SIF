@@ -2,7 +2,10 @@ bs4
 cartopy
 h5py
 matplotlib
+netcdf4
 numpy
+pandas
 pillow
 pyhdf
 requests
+xarray
