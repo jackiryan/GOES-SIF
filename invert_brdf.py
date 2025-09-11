@@ -251,8 +251,10 @@ def compute_reflectance(
     Returns:
         npt.NDArray[np.float32]: Surface reflectance
     """
-    Fvol = ross_thick_kernel(cosThetaI, cosThetaV, rAz)
-    Fgeo = li_sparse_kernel(cosThetaI, cosThetaV, rAz)
+    nadirs = np.zeros((600, 600), dtype=np.float32)
+    cosThetaV = np.ones_like(nadirs)
+    Fvol = ross_thick_kernel(cosThetaI, cosThetaV, nadirs) #cosThetaV, rAz)
+    Fgeo = li_sparse_kernel(cosThetaI, cosThetaV, nadirs) #cosThetaV, rAz)
 
     """
     print("kernel data ranges:")
