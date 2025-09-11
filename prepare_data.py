@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup
 import calendar
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from glob import glob
 import numpy as np
 import numpy.typing as npt
@@ -27,6 +27,61 @@ OCO3_VARIABLES: dict[str, str] = {
 }
 
 
+def solar_zenith_angle(
+        date_array: npt.NDArray[np.datetime64],
+        latitude: npt.NDArray[np.float32],
+        longitude:npt.NDArray[np.float32]
+) -> npt.NDArray[np.float32]:
+    """
+    Calculate solar zenith angle empirically for BRDF inversion.
+    """
+    
+    # Convert datetime64 to pandas datetime for easier manipulation, then extract components
+    # Convert to pandas datetime to easily extract components
+    dt_pandas = pd.to_datetime(date_array)
+    
+    # Calculate day of year (1-365/366)
+    day_of_year = dt_pandas.dayofyear.values
+    
+    # Calculate fractional hour
+    fractional_hour = dt_pandas.hour.values + dt_pandas.minute.values/60.0 + dt_pandas.second.values/3600.0
+    
+    # Convert latitude and longitude to radians
+    lat_rad = np.radians(latitude.astype(np.float64))
+    lon_rad = np.radians(longitude.astype(np.float64))
+    
+    # Calculate solar declination angle (in radians)
+    # Using Cooper's equation: δ = 23.45° * sin(360° * (284 + n) / 365)
+    declination_deg = 23.45 * np.sin(np.radians(360 * (284 + day_of_year) / 365.25))
+    declination_rad = np.radians(declination_deg)
+    
+    # Calculate equation of time (simplified approximation in minutes)
+    B = np.radians(360 * (day_of_year - 81) / 365.25)
+    equation_of_time = 9.87 * np.sin(2*B) - 7.53 * np.cos(B) - 1.5 * np.sin(B)
+    
+    # Calculate solar time
+    time_correction = equation_of_time + 4 * np.degrees(lon_rad)  # in minutes
+    solar_time = fractional_hour + time_correction / 60.0
+    
+    # Calculate hour angle (in radians)
+    # Hour angle = 15° * (solar_time - 12)
+    hour_angle_deg = 15 * (solar_time - 12)
+    hour_angle_rad = np.radians(hour_angle_deg)
+    
+    # Calculate solar zenith angle using the fundamental formula:
+    # cos(θz) = sin(φ)sin(δ) + cos(φ)cos(δ)cos(h)
+    cos_zenith = (np.sin(lat_rad) * np.sin(declination_rad) + 
+                  np.cos(lat_rad) * np.cos(declination_rad) * np.cos(hour_angle_rad))
+    
+    # Ensure cos_zenith is within valid range [-1, 1] to avoid math domain errors
+    cos_zenith = np.clip(cos_zenith, -1, 1)
+    
+    # Calculate zenith angle in radians
+    zenith_angle = np.arccos(cos_zenith)
+    
+    return np.rad2deg(zenith_angle)
+
+
 def generate_dates(start_date: datetime, end_date: datetime) -> list[datetime]:
     """
     Generate a list of dates from start_date to end_date (inclusive).
@@ -44,6 +99,14 @@ def generate_dates(start_date: datetime, end_date: datetime) -> list[datetime]:
         dates.append(current_date)
         current_date += timedelta(days=1)
     return dates
+
+
+def get_times(hours: npt.NDArray[np.float32], month_ndx: int, day: int) -> npt.NDArray[np.datetime64]:
+    year = 1993 + month_ndx // 12
+    month = month_ndx % 12
+    base_date = np.datetime64(f"{year}-{month:02d}-{day:02d}")
+    datetime_array = (base_date + hours.astype("timedelta64[h]") + np.timedelta64(30, "m"))
+    return datetime_array
 
 
 def open_oco3(oco3_granule: str, engine: str = "netcdf4") -> xr.DataTree:
@@ -64,6 +127,7 @@ def vectorize_dt(dt: xr.DataTree) -> npt.NDArray[np.float32]:
     lat = np.asarray(dt[OCO3_VARIABLES["latitude"]].data)
     lon = np.asarray(dt[OCO3_VARIABLES["longitude"]].data)
     sif740 = np.asarray(dt[OCO3_VARIABLES["sif740"]].data)
+    sza = np.asarray(dt[OCO3_VARIABLES["sza"]].data)
 
     expected_shape = (len(hr), len(lon), len(lat))
     if sif740.shape != expected_shape:
@@ -72,11 +136,21 @@ def vectorize_dt(dt: xr.DataTree) -> npt.NDArray[np.float32]:
     valid_sif = np.where(~np.isnan(sif740))
     hr_ndx, lon_ndx, lat_ndx = valid_sif
 
+    if True:
+        # this is a misnomer, it's actually since 1993-01
+        month_ndx = int(dt["Geolocation/month_since_199001"].data)
+        day_ndx = int(dt["Geolocation/day_of_month"].data[0])
+        data_times = get_times(hr[hr_ndx], month_ndx, day_ndx)
+        computed_sza = solar_zenith_angle(data_times, lat[lat_ndx], lon[lon_ndx])
+
+
     vectorized_data = np.vstack([
         hr[hr_ndx],
         lon[lon_ndx],
         lat[lat_ndx],
-        sif740[hr_ndx, lon_ndx, lat_ndx]
+        sif740[hr_ndx, lon_ndx, lat_ndx],
+        sza[hr_ndx, lon_ndx, lat_ndx],
+        computed_sza
     ])
     return vectorized_data
 
@@ -86,6 +160,7 @@ def process_1day_matrix(
         data_dir: str,
         engine: str
 ) -> npt.NDArray[np.float32]:
+    ndim = 6
     year = data_day.year
     month = f"{int(data_day.month):02d}"
     day = f"{int(data_day.day):02d}"
@@ -99,12 +174,12 @@ def process_1day_matrix(
         return vectorized_day
     except IndexError:
         print(f"Warning: no granule found for {data_day.strftime('%Y-%m-%d')}. Skipping...")
-        return np.empty((4, 0), dtype=np.float32)
+        return np.empty((ndim, 0), dtype=np.float32)
     except Exception as e:
         if "dt" in locals().keys():
             dt.close() # type: ignore
         print(f"Unexpected {type(e)} when processing granule for {data_day.strftime('%Y-%m-%d')}: {e}. Skipping...")
-        return np.empty((4, 0), dtype=np.float32)
+        return np.empty((ndim, 0), dtype=np.float32)
 
 
 def latlon_to_geonex_grid(
@@ -320,7 +395,7 @@ def main() -> int:
     year = 2020
     month = 6
     output_csv = f"oco3_1p00d_{year}{month:02d}_vector.csv"
-    download_brdfs = True
+    download_brdfs = False
     start_date = datetime(year, month, 1)
     _, num_days = calendar.monthrange(year, month)
     end_date = datetime(year, month, num_days)
@@ -333,7 +408,7 @@ def main() -> int:
             all_tiles.extend(find_geonex_tiles(daily_data[-1], date))
     combined_data = np.hstack(daily_data)
     data_transposed = combined_data.T
-    columns = ["hour", "longitude", "latitude", "sif_740nm"]
+    columns = ["hour", "longitude", "latitude", "sif_740nm", "SZA", "comp_SZA"]
     df = pd.DataFrame(data_transposed, columns=columns)
     df.to_csv(output_csv, index=False)
 
@@ -344,9 +419,7 @@ def main() -> int:
     if download_brdfs:
         downloaded_files = download_goes_brdfs(all_tiles)
 
-        print(f"Downloaded {len(downloaded_files)} files:")
-        for file_path in downloaded_files:
-            print(f"  {file_path}")
+        print(f"Downloaded {len(downloaded_files)} files.")
     return 0
 
 if __name__ == "__main__":
