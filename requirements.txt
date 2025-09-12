@@ -8,4 +8,5 @@ pandas
 pillow
 pyhdf
 requests
+tqdm
 xarray

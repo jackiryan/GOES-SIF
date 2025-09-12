@@ -224,11 +224,11 @@ def _group_tiles_by_index(tile_list: list[tuple[str, datetime]]) -> dict[str, li
     return tile_date_map
 
 
-def _fetch_tile_directory_listing(tile_index: str, year: int, session: requests.Session) -> list[tuple[str, str]]:
-    """Fetch and parse directory listing for a tile, returning (href, filename) pairs."""
-    BASE_URL = "https://data.nas.nasa.gov/geonex/GOES16/GEONEX-L2/MAIAC/"
-    year_dir_url = urljoin(BASE_URL, f"{tile_index}/{year}/")
-    
+def _fetch_tile_directory_listing(
+        year_dir_url: str,
+        session: requests.Session
+) -> list[tuple[str, str]]:
+    """Fetch and parse directory listing for a GeoNEX URL, returning (href, filename) pairs."""
     response = session.get(year_dir_url)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
@@ -240,7 +240,7 @@ def _fetch_tile_directory_listing(tile_index: str, year: int, session: requests.
     hdf_links = []
     for link in links:
         href = link["href"]
-        if href.endswith(".hdf"):
+        if href.endswith(".hdf") or href.endswith(".h5"):
             # Extract just the filename from the href path
             filename = href.split("/")[-1]
             hdf_links.append((href, filename))
@@ -339,7 +339,7 @@ def download_goes_brdfs(
             year_dir_url = urljoin(BASE_URL, f"{tile_index}/{year}/")
             
             # Fetch directory listing once per tile
-            hdf_links = _fetch_tile_directory_listing(tile_index, year, session)
+            hdf_links = _fetch_tile_directory_listing(year_dir_url, session)
             print(f"Found {len(hdf_links)} HDF files in directory")
             
             # Create tile-specific subdirectory
@@ -384,6 +384,91 @@ def download_goes_brdfs(
     
     print(f"\nDownload complete. Successfully downloaded {len(downloaded_files)} files.")
     return downloaded_files
+
+def download_goes_par(
+        tile_list: list[tuple[str, datetime]], 
+        output_dir: str = "./goes_data",
+        session: requests.Session | None = None
+) -> list[str]:
+    """
+    Download GOES-16 PAR HDF files for specified tiles and dates.
+    """
+    BASE_URL = "https://data.nas.nasa.gov/geonex/GOES16/GEONEX-L2/DSR-PAR/"
+    
+    session, output_path = _setup_session_and_output(output_dir, session)
+    tile_date_map = _group_tiles_by_index(tile_list)
+    
+    print(f"Processing {len(tile_date_map)} unique tiles with {len(tile_list)} total requests")
+    
+    downloaded_files = []
+    
+    # Process each unique tile_index
+    for tile_index, dates in tile_date_map.items():
+        try:
+            print(f"\nProcessing tile {tile_index} with {len(dates)} dates")
+            
+            # Get the year from first date (assuming all dates are same year)
+            year = dates[0].year
+            year_dir_url = urljoin(BASE_URL, f"{year}/hourly/{tile_index}/")
+            
+            # Fetch directory listing once per tile
+            hdf_links = _fetch_tile_directory_listing(year_dir_url, session)
+            print(f"Found {len(hdf_links)} H5 files in directory")
+            
+            # Create tile-specific subdirectory
+            tile_output_dir = output_path / tile_index
+            tile_output_dir.mkdir(exist_ok=True)
+            
+            # Process each date for this tile using cached directory listing
+            for date in dates:
+                try:
+                    day_of_year = date.timetuple().tm_yday
+                    print(f"  Processing date {date.strftime('%Y-%m-%d')} (DOY {day_of_year})")
+                    
+                    # Find matching file
+                    year = date.year
+                    day_of_year = date.timetuple().tm_yday
+                    
+                    # Create regex pattern to match the expected filename format
+                    # G016_DSR_{year}{doy:03d}_{tile_index}.h5 (note the 0!!!! Arghhhhh)
+                    pattern = rf"G016_DSR_{year}{day_of_year:03d}_{re.escape(tile_index)}\.h5"
+                    
+                    matching_links = [(href, filename) for href, filename in hdf_links 
+                                    if re.match(pattern, filename)]
+                    
+                    if not matching_links:
+                        print(f"    WARNING: No matching file found for {date.strftime('%Y-%m-%d')} (DOY {day_of_year:03d})")
+                        continue
+                    
+                    if len(matching_links) > 1:
+                        print(f"INFO: Multiple matching files found for tile {tile_index}, using first match: {matching_links[0][1]}")
+                    
+                    href, filename = matching_links[0]
+                    file_url = _construct_file_url(href, year_dir_url)
+                    output_file_path = tile_output_dir / filename
+                    
+                    # Skip if file already exists
+                    if output_file_path.exists():
+                        print(f"    File already exists: {filename}")
+                        downloaded_files.append(str(output_file_path))
+                        continue
+                    
+                    if _download_file(file_url, output_file_path, session):
+                        downloaded_files.append(str(output_file_path))
+                        
+                except Exception as e:
+                    print(f"    ERROR: Failed to process date {date.strftime('%Y-%m-%d')}: {e}")
+                    continue
+                    
+        except requests.RequestException as e:
+            print(f"ERROR: Failed to fetch directory listing for tile {tile_index}: {e}")
+            continue
+        except Exception as e:
+            print(f"ERROR: Unexpected error processing tile {tile_index}: {e}")
+            continue
+    
+    print(f"\nDownload complete. Successfully downloaded {len(downloaded_files)} files.")
+    return downloaded_files
         
         
 def main() -> int:
@@ -393,6 +478,7 @@ def main() -> int:
     month = 6
     output_csv = f"oco3_1p00d_{year}{month:02d}_vector.csv"
     download_brdfs = False
+    download_par = True
     start_date = datetime(year, month, 1)
     _, num_days = calendar.monthrange(year, month)
     end_date = datetime(year, month, num_days)
@@ -417,6 +503,11 @@ def main() -> int:
         downloaded_files = download_goes_brdfs(all_tiles)
 
         print(f"Downloaded {len(downloaded_files)} files.")
+    
+    if download_par:
+        downloaded_par = download_goes_par(all_tiles)
+
+        print(f"Downloaded {len(downloaded_par)} files.")
     return 0
 
 if __name__ == "__main__":

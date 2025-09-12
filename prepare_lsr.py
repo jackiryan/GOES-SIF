@@ -5,7 +5,9 @@ import numpy.typing as npt
 import os
 import pandas as pd
 from pyhdf.SD import SD, SDC
+import h5py
 import sys
+from tqdm import tqdm
 import traceback
 
 
@@ -51,6 +53,41 @@ def parse_coeffs(input_brdf: str) -> npt.NDArray[np.float32]:
     except Exception as e:
         print(f"Error processing BRDF HDF file: {e}")
         traceback.print_exc()
+        sys.exit(1)
+
+
+def parse_par(input_par: str) -> npt.NDArray[np.float32]:
+    """
+    Load PAR data from HDF-5 file.
+    
+    Args:
+        input_file (str): Path to input HDF-5 file
+        
+    Returns:
+        numpy.ndarray: PAR data array with shape (24, 600, 600)
+        
+    Raises:
+        SystemExit: If file cannot be read or PAR_hourly variable is missing
+    """
+    try:
+        with h5py.File(input_par, "r") as hdf_file:
+            if "PAR_hourly" not in hdf_file:
+                print("Error: 'PAR_hourly' variable not found in HDF-5 file")
+                print("Available variables:", list(hdf_file.keys()))
+                sys.exit(1)
+            
+            par_data = np.array(hdf_file["PAR_hourly"][:], dtype=np.int16) # type: ignore
+            par_masked = np.where(par_data == -9999, np.nan, par_data)
+            # Apply a scaling, ideally this would come from Dongdong Wang's User Guide, but I couldn't find it,
+            # so I guessed based on looking at values in https://doi.org/10.5194/essd-15-1419-2023
+            par_data_scaled = np.array(par_masked * 0.1, dtype=np.float32)
+            # print(f"Successfully loaded PAR data with shape: {par_data.shape}")
+            # print(f"PAR range: {np.nanmin(par_data_scaled):.2f} to {np.nanmax(par_data_scaled):.2f} W/m²")
+            
+            return par_data_scaled
+            
+    except Exception as e:
+        print(f"Error reading HDF-5 file: {e}")
         sys.exit(1)
 
 
@@ -193,19 +230,32 @@ def invert_brdf(filename, lats, lons, szas):
     return reflectance
 
 
+def sample_par(filename, lats, lons, hours):
+    tile_index = filename.split("/")[1]
+    h_ndx = int(tile_index[1:3])
+    v_ndx = int(tile_index[4:6])
+    ul_lat = 60 - (v_ndx * 6)
+    ul_lon = -180 + (h_ndx * 6)
+    x_coords = np.floor((lons - ul_lon) / 0.01).astype(int)
+    y_coords = np.floor((lats - ul_lat) / 0.01).astype(int)
+    par = np.zeros(len(x_coords), dtype=np.float32)
+    all_par = parse_par(filename)
+    par = all_par[hours.astype(int), y_coords, x_coords]
+    return par
+
 def find_matching_brdf(row, root_dir="goes_data/"):
     """
     Find the matching BRDF file for a given row of data.
     """
-    date_str = str(int(row['date']))
+    date_str = str(int(row["date"]))
     year = int(date_str[:4])
     month = int(date_str[4:6]) 
     day = int(date_str[6:8])
     date_obj = datetime(year, month, day)
     day_of_year = date_obj.timetuple().tm_yday
     date = f"{year}{day_of_year:03d}"
-    lon = row['longitude']
-    lat = row['latitude']
+    lon = row["longitude"]
+    lat = row["latitude"]
     
     # Calculate tile indices
     h_ndx = int(np.floor((lon + 180) / 6))
@@ -220,8 +270,49 @@ def find_matching_brdf(row, root_dir="goes_data/"):
         return None
     
     # Look for files matching the date pattern
-    # Pattern: GO16_ABI12C_{date}HHMM_GLBG_h{h_ndx}v{v_ndx}_02.hdf
-    pattern = f"GO16_ABI12C_{date}*_GLBG_h{h_ndx:02d}v{v_ndx:02d}_02.hdf"
+    # Pattern: GO16_ABI12C_{date}HHMM_GLBG_h{h_ndx}v{v_ndx}_*.hdf
+    pattern = f"GO16_ABI12C_{date}*_GLBG_h{h_ndx:02d}v{v_ndx:02d}_*.hdf"
+    search_pattern = os.path.join(full_tile_path, pattern)
+    
+    # Find matching files
+    matching_files = glob.glob(search_pattern)
+    
+    if matching_files:
+        # Return the first match (there should typically be only one)
+        return matching_files[0]
+    else:
+        return None
+
+
+def find_matching_par(row, root_dir="goes_data/"):
+    """
+    Find the matching DSR-PAR file for a given row of data.
+    """
+    date_str = str(int(row["date"]))
+    year = int(date_str[:4])
+    month = int(date_str[4:6]) 
+    day = int(date_str[6:8])
+    date_obj = datetime(year, month, day)
+    day_of_year = date_obj.timetuple().tm_yday
+    date = f"{year}{day_of_year:03d}"
+    lon = row["longitude"]
+    lat = row["latitude"]
+    
+    # Calculate tile indices
+    h_ndx = int(np.floor((lon + 180) / 6))
+    v_ndx = int(np.floor((60 - lat) / 6))
+    
+    # Create tile directory path
+    tile_dir = f"h{h_ndx:02d}v{v_ndx:02d}"
+    full_tile_path = os.path.join(root_dir, tile_dir)
+    
+    # Check if tile directory exists
+    if not os.path.exists(full_tile_path):
+        return None
+    
+    # Look for files matching the date pattern
+    # Pattern: G016_DSR_{date}_GLBG_h{h_ndx}v{v_ndx}.h5
+    pattern = f"G016_DSR_{date}_h{h_ndx:02d}v{v_ndx:02d}.h5"
     search_pattern = os.path.join(full_tile_path, pattern)
     
     # Find matching files
@@ -239,33 +330,34 @@ def process_brdf_data(df):
     Batch process rows one BRDF file at a time. Result adds LSR columns to DF.
     """
     # Initialize new columns with NaN
-    df['LSR_Blue'] = np.nan
-    df['LSR_Red'] = np.nan 
-    df['LSR_NIR'] = np.nan
+    df["LSR_Blue"] = np.nan
+    df["LSR_Red"] = np.nan 
+    df["LSR_NIR"] = np.nan
     
     # Only process rows that have valid file paths
-    valid_rows = df[df['hdf_file_path'].notna()].copy()
+    valid_rows = df[df["hdf_file_path"].notna()].copy()
     
     if len(valid_rows) == 0:
         print("No valid HDF file paths found. Skipping BRDF processing.")
         return df
     
     # Group by HDF file path
-    grouped = valid_rows.groupby('hdf_file_path')
+    grouped = valid_rows.groupby("hdf_file_path")
     
     print(f"\nProcessing BRDF data for {len(grouped)} unique HDF files...")
     
     processed_files = 0
     total_samples = 0
     
-    for hdf_file, group in grouped:
+    for hdf_file, group in tqdm(grouped, desc="Computing LSR from BRDFs"):
         try:
             # Extract coordinates and SZA values for this group
-            lats = group['latitude'].values
-            lons = group['longitude'].values  
-            szas = group['comp_SZA'].values
+            lats = group["latitude"].values
+            lons = group["longitude"].values 
+            #szas = group["comp_SZA"].values
+            szas = group["SZA"].values
             
-            print(f"Processing file: {os.path.basename(hdf_file)} ({len(group)} samples)")
+            # print(f"Processing file: {os.path.basename(hdf_file)} ({len(group)} samples)")
             
             # Call the BRDF inversion function
             brdf_results = invert_brdf(hdf_file, lats, lons, np.deg2rad(szas))
@@ -276,9 +368,9 @@ def process_brdf_data(df):
                 continue
             
             # Assign results back to the original DataFrame using the group indices
-            df.loc[group.index, 'LSR_Blue'] = brdf_results[0, :]
-            df.loc[group.index, 'LSR_Red'] = brdf_results[2, :]
-            df.loc[group.index, 'LSR_NIR'] = brdf_results[3, :]
+            df.loc[group.index, "LSR_Blue"] = brdf_results[0, :]
+            df.loc[group.index, "LSR_Red"] = brdf_results[2, :]
+            df.loc[group.index, "LSR_NIR"] = brdf_results[3, :]
             processed_files += 1
             total_samples += len(group)
             
@@ -289,8 +381,62 @@ def process_brdf_data(df):
     print(f"\nBRDF processing complete:")
     print(f"Files processed successfully: {processed_files}")
     print(f"Total samples processed: {total_samples}")
-    print(f"Rows with BRDF data: {df[['LSR_Blue', 'LSR_Red', 'LSR_NIR']].notna().all(axis=1).sum()}")
+    print(f"Rows with LSR data: {df[['LSR_Blue', 'LSR_Red', 'LSR_NIR']].notna().all(axis=1).sum()}")
     
+    return df
+
+
+def process_par_data(df):
+    """
+    Batch process rows one BRDF file at a time. Result adds LSR columns to DF.
+    """
+    # Initialize new columns with NaN
+    df["PAR"] = np.nan
+    
+    # Only process rows that have valid file paths
+    valid_rows = df[df["par_file_path"].notna()].copy()
+    
+    if len(valid_rows) == 0:
+        print("No valid H5 file paths found. Skipping PAR processing.")
+        return df
+    
+    # Group by PAR file path
+    grouped = valid_rows.groupby("par_file_path")
+    
+    print(f"\nProcessing PAR data for {len(grouped)} unique H5 files...")
+    
+    processed_files = 0
+    total_samples = 0
+    
+    for hdf_file, group in tqdm(grouped, desc="Sampling PAR"):
+        try:
+            # Extract coordinates and hour values for this group
+            lats = group["latitude"].values
+            lons = group["longitude"].values  
+            hours = group["hour"].values
+            
+            # print(f"Processing file: {os.path.basename(hdf_file)} ({len(group)} samples)")
+            
+            par_results = sample_par(hdf_file, lats, lons, hours)
+            
+            # Verify the results have the expected shape
+            if len(par_results) != len(group):
+                print(f"Warning: Unexpected PAR result shape {par_results.shape}, expected ({len(group)},)")
+                continue
+            
+            # Assign results back to the original DataFrame using the group indices
+            df.loc[group.index, "PAR"] = par_results
+            processed_files += 1
+            total_samples += len(group)
+            
+        except Exception as e:
+            print(f"Error processing file {hdf_file}: {str(e)}")
+            continue
+    
+    print(f"\nPAR processing complete:")
+    print(f"Files processed successfully: {processed_files}")
+    print(f"Total samples processed: {total_samples}")
+    print(f"Rows with LSR and PAR data: {df[['LSR_Blue', 'LSR_Red', 'LSR_NIR', 'PAR']].notna().all(axis=1).sum()}")
     return df
 
 
@@ -298,11 +444,14 @@ def main() -> int:
     year = 2020
     month = 6
     input_csv = f"oco3_1p00d_{year}{month:02d}_vector.csv"
-    output_csv = f"oco3_1p00d_{year}{month:02d}_lsr.csv"
+    output_csv = f"oco3_1p00d_{year}{month:02d}_lsr_par.csv"
     df = pd.read_csv(input_csv)
-    df['hdf_file_path'] = df.apply(find_matching_brdf, axis=1)
+    df["hdf_file_path"] = df.apply(find_matching_brdf, axis=1)
+    df["par_file_path"] = df.apply(find_matching_par, axis=1)
     df = process_brdf_data(df)
-    df.to_csv(output_csv, index=False)
+    df = process_par_data(df)
+    df_nofname = df.drop(["hdf_file_path", "par_file_path", "SZA", "comp_SZA"], axis=1)
+    df_nofname.to_csv(output_csv, index=False)
 
     return 0
 
