@@ -268,7 +268,7 @@ def process_brdf_data(df):
             print(f"Processing file: {os.path.basename(hdf_file)} ({len(group)} samples)")
             
             # Call the BRDF inversion function
-            brdf_results = invert_brdf(hdf_file, lats, lons, szas)
+            brdf_results = invert_brdf(hdf_file, lats, lons, np.deg2rad(szas))
             
             # Verify the results have the expected shape
             if brdf_results.shape[0] != 4 or brdf_results.shape[1] != len(group):
@@ -279,7 +279,6 @@ def process_brdf_data(df):
             df.loc[group.index, 'LSR_Blue'] = brdf_results[0, :]
             df.loc[group.index, 'LSR_Red'] = brdf_results[2, :]
             df.loc[group.index, 'LSR_NIR'] = brdf_results[3, :]
-            
             processed_files += 1
             total_samples += len(group)
             
