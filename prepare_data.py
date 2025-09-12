@@ -10,9 +10,10 @@ from pathlib import Path
 import re
 import requests
 import sys
+from tqdm import tqdm
 from urllib.parse import urljoin
 import xarray as xr
-
+"""
 OCO3_VARIABLES: dict[str, str] = {
     "latitude": "Geolocation/latitude",
     "longitude": "Geolocation/longitude",
@@ -25,6 +26,20 @@ OCO3_VARIABLES: dict[str, str] = {
     "sza": "Science/SZA",
     "vaz": "Science/VAz",
     "vza": "Science/VZA"
+}
+"""
+OCO3_VARIABLES: dict[str, str] = {
+    "latitude": "Geolocation/latitude",
+    "longitude": "Geolocation/longitude",
+    "hour": "Geolocation/hour_of_day",
+    "sif740": "Science/sif740",
+    "sif757": "Science/sif757",
+    "tair": "Science/tskin",
+    "vpd": "Science/vpd",
+    "saz": "Science/saa",
+    "sza": "Science/sza",
+    "vaz": "Science/vaa",
+    "vza": "Science/vza"
 }
 
 
@@ -121,7 +136,7 @@ def open_oco3(oco3_granule: str, engine: str = "netcdf4") -> xr.DataTree:
     return dt
 
 
-def vectorize_dt(dt: xr.DataTree, data_day: datetime) -> npt.NDArray[np.float32]:
+def vectorize_dt(dt: xr.DataTree, data_day: datetime, compute_sza: bool = False) -> npt.NDArray[np.float32]:
     hr = np.asarray(dt[OCO3_VARIABLES["hour"]].data)
     lat = np.asarray(dt[OCO3_VARIABLES["latitude"]].data)
     lon = np.asarray(dt[OCO3_VARIABLES["longitude"]].data)
@@ -135,39 +150,54 @@ def vectorize_dt(dt: xr.DataTree, data_day: datetime) -> npt.NDArray[np.float32]
     valid_sif = np.where(~np.isnan(sif740))
     hr_ndx, lon_ndx, lat_ndx = valid_sif
 
-    if True:
+    if compute_sza:
         data_times = get_times(hr[hr_ndx], data_day)
         computed_sza = solar_zenith_angle(data_times, lat[lat_ndx], lon[lon_ndx])
-
-
-    vectorized_data = np.vstack([
-        len(hr_ndx) * [float(data_day.strftime("%Y%m%d"))],
-        hr[hr_ndx],
-        lon[lon_ndx],
-        lat[lat_ndx],
-        sif740[hr_ndx, lon_ndx, lat_ndx],
-        sza[hr_ndx, lon_ndx, lat_ndx],
-        computed_sza
-    ])
+        vectorized_data = np.vstack([
+            len(hr_ndx) * [float(data_day.strftime("%Y%m%d"))],
+            hr[hr_ndx],
+            lon[lon_ndx],
+            lat[lat_ndx],
+            sif740[hr_ndx, lon_ndx, lat_ndx],
+            sza[hr_ndx, lon_ndx, lat_ndx],
+            computed_sza
+        ])
+    else:
+        vectorized_data = np.vstack([
+            len(hr_ndx) * [float(data_day.strftime("%Y%m%d"))],
+            hr[hr_ndx],
+            lon[lon_ndx],
+            lat[lat_ndx],
+            sif740[hr_ndx, lon_ndx, lat_ndx],
+            sza[hr_ndx, lon_ndx, lat_ndx]
+        ])
     return vectorized_data
 
 
 def process_1day_matrix(
         data_day: datetime,
         data_dir: str,
-        engine: str
+        engine: str,
+        is_1deg: bool = True,
+        compute_sza: bool = False
 ) -> npt.NDArray[np.float32]:
-    ndim = 7
+    if compute_sza:
+        ndim = 7
+    else:
+        ndim = 6
     year = data_day.year
     month = f"{int(data_day.month):02d}"
     day = f"{int(data_day.day):02d}"
-    granule_wildcard = os.path.join(data_dir, f"{year}/{month}/oco3_goessif_{year}{month}{day}_ndgl_*.nc4")
+    if is_1deg:
+        granule_wildcard = os.path.join(data_dir, f"{year}/{month}/oco3_goessif_{year}{month}{day}_ndgl_*.nc4")
+    else:
+        granule_wildcard = os.path.join(data_dir, f"oco3_geossif_0p01d_{year}{month}{day}_ndgl_*.nc4")
     results = glob(granule_wildcard)
     try:
         # Use the first result, otherwise throw IndexError if file not found
         oco3_granule = results[0]
         dt = open_oco3(oco3_granule, engine)
-        vectorized_day = vectorize_dt(dt, data_day)
+        vectorized_day = vectorize_dt(dt, data_day, compute_sza)
         return vectorized_day
     except IndexError:
         print(f"Warning: no granule found for {data_day.strftime('%Y-%m-%d')}. Skipping...")
@@ -198,6 +228,32 @@ def find_geonex_tiles(vectorized_data: npt.NDArray[np.float32], date: datetime) 
     tiles = [f"h{h_val:02d}v{v_val:02d}" for h_val, v_val in zip(h_ndx, v_ndx)]
     uniq_tiles = list(set(tiles))
     return [(tile, date) for tile in uniq_tiles]
+
+
+def sample_igbp(df: pd.DataFrame) -> None:
+    df["IGBP_Primary"] = np.nan
+    df["IGBP_Secondary"] = np.nan
+
+    igbp_file = "conus/modis/MCD12Q1.061_500m_aid0001_2020_CONUS_0p01deg.nc4"
+    # igbp_file = "conus/viirs/VIIRS-AST-IGBP17-GEO_v1r0_2020_CONUS_0p01deg.nc4"
+    dt = open_oco3(igbp_file)
+    surface_type = np.asarray(dt["IGBP17/surface_type"].data)
+    ul_lat = 20
+    ul_lon = -135
+    lon_coords = np.floor((df["longitude"].values - ul_lon) / 0.01).astype(int)
+    lat_coords = np.floor((df["latitude"].values - ul_lat) / 0.01).astype(int)
+    valid_mask = ((lon_coords >= 0) & (lon_coords < surface_type.shape[0]) & 
+                  (lat_coords >= 0) & (lat_coords < surface_type.shape[1]))
+    valid_indices = np.where(valid_mask)[0]
+    primary_class = surface_type[lon_coords, lat_coords, 0]
+    secondary_class = surface_type[lon_coords, lat_coords, 1]
+
+    df.loc[valid_indices, "IGBP_Primary"] = primary_class
+    secondary_mask = secondary_class != 0
+    df.loc[valid_indices[secondary_mask], "IGBP_Secondary"] = secondary_class[secondary_mask]
+    df.loc[valid_indices[~secondary_mask], "IGBP_Secondary"] = primary_class[~secondary_mask]
+
+
 
 def _setup_session_and_output(output_dir: str, session: requests.Session | None = None) -> tuple[requests.Session, Path]:
     """Set up the requests session and output directory."""
@@ -472,27 +528,38 @@ def download_goes_par(
         
         
 def main() -> int:
-    data_dir = "oco3_1p00d/ndgl/1p00d/"
+    is_1deg = False
+    compute_sza = False
+    if is_1deg:
+        data_dir = "oco3_1p00d/ndgl/1p00d/"
+    else:
+        data_dir = "oco3_0p01d/ndgl/0p01d/"
     engine = "netcdf4"
     year = 2020
     month = 6
-    output_csv = f"oco3_1p00d_{year}{month:02d}_vector.csv"
+    if is_1deg:
+        output_csv = f"oco3_1p00d_{year}{month:02d}_sif_lc.csv"
+    else:
+        output_csv = f"oco3_0p01d_{year}{month:02d}_sif_lc.csv"
     download_brdfs = False
-    download_par = True
+    download_par = False
     start_date = datetime(year, month, 1)
     _, num_days = calendar.monthrange(year, month)
     end_date = datetime(year, month, num_days)
     dates = generate_dates(start_date, end_date)
     daily_data: list[npt.NDArray] = []
     all_tiles: list[tuple[str, datetime]] = []
-    for date in dates:
-        daily_data.append(process_1day_matrix(date, data_dir, engine))
+    for date in tqdm(dates, desc="Processing dates"):
+        daily_data.append(process_1day_matrix(date, data_dir, engine, is_1deg, compute_sza))
         if len(daily_data[-1]) > 0:
             all_tiles.extend(find_geonex_tiles(daily_data[-1], date))
     combined_data = np.hstack(daily_data)
     data_transposed = combined_data.T
-    columns = ["date", "hour", "longitude", "latitude", "sif_740nm", "SZA", "comp_SZA"]
+    columns = ["date", "hour", "longitude", "latitude", "sif_740nm", "SZA"]
+    if compute_sza:
+        columns.append("comp_SZA")
     df = pd.DataFrame(data_transposed, columns=columns)
+    sample_igbp(df)
     df.to_csv(output_csv, index=False)
 
     # print("All tiles to download:")
