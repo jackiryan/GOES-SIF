@@ -83,7 +83,7 @@ def parse_coeffs(input_brdf: str) -> npt.NDArray[np.float32]:
         
         return coeffs
     except Exception as e:
-        print(f"Error processing Surface Reflectance HDF file: {e}")
+        print(f"Error processing BRDF HDF file: {e}")
         traceback.print_exc()
         sys.exit(1)
 

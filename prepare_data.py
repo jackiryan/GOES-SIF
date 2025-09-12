@@ -9,6 +9,7 @@ import pandas as pd
 from pathlib import Path
 import re
 import requests
+import sys
 from urllib.parse import urljoin
 import xarray as xr
 
@@ -101,10 +102,8 @@ def generate_dates(start_date: datetime, end_date: datetime) -> list[datetime]:
     return dates
 
 
-def get_times(hours: npt.NDArray[np.float32], month_ndx: int, day: int) -> npt.NDArray[np.datetime64]:
-    year = 1993 + month_ndx // 12
-    month = month_ndx % 12
-    base_date = np.datetime64(f"{year}-{month:02d}-{day:02d}")
+def get_times(hours: npt.NDArray[np.float32], data_day: datetime) -> npt.NDArray[np.datetime64]:
+    base_date = np.datetime64(data_day.strftime("%Y-%m-%d"))
     datetime_array = (base_date + hours.astype("timedelta64[h]") + np.timedelta64(30, "m"))
     return datetime_array
 
@@ -122,7 +121,7 @@ def open_oco3(oco3_granule: str, engine: str = "netcdf4") -> xr.DataTree:
     return dt
 
 
-def vectorize_dt(dt: xr.DataTree) -> npt.NDArray[np.float32]:
+def vectorize_dt(dt: xr.DataTree, data_day: datetime) -> npt.NDArray[np.float32]:
     hr = np.asarray(dt[OCO3_VARIABLES["hour"]].data)
     lat = np.asarray(dt[OCO3_VARIABLES["latitude"]].data)
     lon = np.asarray(dt[OCO3_VARIABLES["longitude"]].data)
@@ -137,14 +136,12 @@ def vectorize_dt(dt: xr.DataTree) -> npt.NDArray[np.float32]:
     hr_ndx, lon_ndx, lat_ndx = valid_sif
 
     if True:
-        # this is a misnomer, it's actually since 1993-01
-        month_ndx = int(dt["Geolocation/month_since_199001"].data)
-        day_ndx = int(dt["Geolocation/day_of_month"].data[0])
-        data_times = get_times(hr[hr_ndx], month_ndx, day_ndx)
+        data_times = get_times(hr[hr_ndx], data_day)
         computed_sza = solar_zenith_angle(data_times, lat[lat_ndx], lon[lon_ndx])
 
 
     vectorized_data = np.vstack([
+        len(hr_ndx) * [float(data_day.strftime("%Y%m%d"))],
         hr[hr_ndx],
         lon[lon_ndx],
         lat[lat_ndx],
@@ -160,7 +157,7 @@ def process_1day_matrix(
         data_dir: str,
         engine: str
 ) -> npt.NDArray[np.float32]:
-    ndim = 6
+    ndim = 7
     year = data_day.year
     month = f"{int(data_day.month):02d}"
     day = f"{int(data_day.day):02d}"
@@ -170,7 +167,7 @@ def process_1day_matrix(
         # Use the first result, otherwise throw IndexError if file not found
         oco3_granule = results[0]
         dt = open_oco3(oco3_granule, engine)
-        vectorized_day = vectorize_dt(dt)
+        vectorized_day = vectorize_dt(dt, data_day)
         return vectorized_day
     except IndexError:
         print(f"Warning: no granule found for {data_day.strftime('%Y-%m-%d')}. Skipping...")
@@ -195,8 +192,8 @@ def latlon_to_geonex_grid(
 
 
 def find_geonex_tiles(vectorized_data: npt.NDArray[np.float32], date: datetime) -> list[tuple[str, datetime]]:
-    lons = vectorized_data[1, :]
-    lats = vectorized_data[2, :]
+    lons = vectorized_data[2, :]
+    lats = vectorized_data[3, :]
     h_ndx, v_ndx = latlon_to_geonex_grid(lats, lons)
     tiles = [f"h{h_val:02d}v{v_val:02d}" for h_val, v_val in zip(h_ndx, v_ndx)]
     uniq_tiles = list(set(tiles))
@@ -408,7 +405,7 @@ def main() -> int:
             all_tiles.extend(find_geonex_tiles(daily_data[-1], date))
     combined_data = np.hstack(daily_data)
     data_transposed = combined_data.T
-    columns = ["hour", "longitude", "latitude", "sif_740nm", "SZA", "comp_SZA"]
+    columns = ["date", "hour", "longitude", "latitude", "sif_740nm", "SZA", "comp_SZA"]
     df = pd.DataFrame(data_transposed, columns=columns)
     df.to_csv(output_csv, index=False)
 
@@ -423,4 +420,4 @@ def main() -> int:
     return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
