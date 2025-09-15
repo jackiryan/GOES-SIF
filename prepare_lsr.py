@@ -443,8 +443,10 @@ def process_par_data(df):
 def main() -> int:
     year = 2020
     month = 6
-    input_csv = f"oco3_1p00d_{year}{month:02d}_sif_lc.csv"
-    output_csv = f"oco3_1p00d_{year}{month:02d}_lsr_par.csv"
+    #input_csv = f"oco3_1p00d_{year}{month:02d}_sif_lc.csv"
+    input_csv = f"oco3_0p01d_{year}{month:02d}_sif_lc.csv"
+    #output_csv = f"oco3_1p00d_{year}{month:02d}_lsr_par.csv"
+    output_csv = f"oco3_0p01d_{year}{month:02d}_lsr_par_clean.csv"
     df = pd.read_csv(input_csv)
     df["hdf_file_path"] = df.apply(find_matching_brdf, axis=1)
     df["par_file_path"] = df.apply(find_matching_par, axis=1)
@@ -452,7 +454,8 @@ def main() -> int:
     df = process_par_data(df)
     #df_nofname = df.drop(["hdf_file_path", "par_file_path", "SZA", "comp_SZA"], axis=1)
     df_nofname = df.drop(["hdf_file_path", "par_file_path", "SZA"], axis=1)
-    df_nofname.to_csv(output_csv, index=False)
+    df_clean = df_nofname.dropna()
+    df_clean.to_csv(output_csv, index=False)
 
     return 0
 
