@@ -306,6 +306,11 @@ if __name__ == "__main__":
     doy = "2020163"
     hr_set = ["12", "17", "23"]
     min_set = ["00", "00", "00"]
+    # Montana
+    #tile_index = "h12v02"
+    #doy = "2020163"
+    #hr_set = ["22", "17", "23"]
+    #min_set = ["00", "00", "00"]
 
     par_vmax = 500
 
@@ -315,6 +320,7 @@ if __name__ == "__main__":
     h_ndx = int(tile_index[1:3])
     v_ndx = int(tile_index[4:6])
     titles = ["Morning (8:00)", "Midday (13:00)", "Evening (19:00)"]
+    #titles = ["Afternoon (22:00 UTC)", "Midday (13:00)", "Evening (19:00)"]
     input_brdf = f"goes_data/{tile_index}/GO16_ABI12C_{doy}2350_GLBG_{tile_index}_02.hdf"
     input_par  = f"goes_data/{tile_index}/G016_DSR_{doy}_{tile_index}.h5"
     kernel_parms = parse_coeffs(input_brdf)
@@ -333,10 +339,13 @@ if __name__ == "__main__":
     lon_grid, lat_grid = np.meshgrid(lon, lat)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    #fig, axes = plt.subplots(2, 1, figsize=(10, 10))
 
     for i, ax in enumerate(axes.flat):
         row = i // 3 # 0 for rtls plots, 1 for par plots
         col = i % 3 # 0, 1, 2 for morning, noon, evening columns
+        #row = i
+        #col = 0
         hr = hr_set[col]
         mins = min_set[col]
 
@@ -362,7 +371,7 @@ if __name__ == "__main__":
             im = ax.pcolormesh(lon_grid, lat_grid, reflectance[nbar_band],
                                vmin=0.0, vmax=0.6, cmap="viridis", shading="auto")
             if col == 0:
-                ax.set_ylabel("Latitude (°N)", fontsize=11)
+                ax.set_ylabel("Latitude (°)", fontsize=11)
             else:
                 ax.set_yticklabels([])
             if col == 2:
@@ -371,7 +380,7 @@ if __name__ == "__main__":
                 cbar = plt.colorbar(im, cax=cbar_ax)
                 cbar.set_label(nbar_title[nbar_band], fontsize=11, rotation=270, labelpad=15)
             ax.set_xticklabels([])
-            #ax.set_aspect('equal', adjustable='box')
+            ax.set_aspect('equal', adjustable='box')
         elif row == 1:
             im = ax.pcolormesh(lon_grid, lat_grid, par_data[int(hr)],
                                vmin=0.0, vmax=par_vmax, cmap="plasma", shading="auto")
@@ -385,6 +394,7 @@ if __name__ == "__main__":
                 cbar = plt.colorbar(im, cax=cbar_ax)
                 cbar.set_label("PAR (W/m²)", fontsize=11, rotation=270, labelpad=15)
             ax.set_xlabel('Longitude (°)', fontsize=11)
+            ax.set_aspect('equal', adjustable='box')
             
     #plt.tight_layout()
     plt.subplots_adjust(hspace=0.1)
