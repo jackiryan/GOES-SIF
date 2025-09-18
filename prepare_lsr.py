@@ -441,12 +441,12 @@ def process_par_data(df):
 
 
 def main() -> int:
-    year = 2020
+    year = 2021
     month = 6
     #input_csv = f"oco3_1p00d_{year}{month:02d}_sif_lc.csv"
-    input_csv = f"oco3_0p01d_{year}{month:02d}_sif_lc.csv"
+    input_csv = f"new_oco3_0p01d_{year}{month:02d}_sif_lc.csv"
     #output_csv = f"oco3_1p00d_{year}{month:02d}_lsr_par.csv"
-    output_csv = f"oco3_0p01d_{year}{month:02d}_lsr_par_clean.csv"
+    output_csv = f"new_oco3_0p01d_{year}{month:02d}_lsr_par_clean.csv"
     df = pd.read_csv(input_csv)
     df["hdf_file_path"] = df.apply(find_matching_brdf, axis=1)
     df["par_file_path"] = df.apply(find_matching_par, axis=1)

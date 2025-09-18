@@ -13,14 +13,14 @@ import sys
 from tqdm import tqdm
 from urllib.parse import urljoin
 import xarray as xr
-"""
+
 OCO3_VARIABLES: dict[str, str] = {
     "latitude": "Geolocation/latitude",
     "longitude": "Geolocation/longitude",
     "hour": "Geolocation/hour_of_day",
     "sif740": "Science/SIF_740nm",
     "sif757": "Science/SIF_757nm",
-    "tair": "Science/temperature_two_meter",
+    "tair": "Science/temperature_skin",
     "vpd": "Science/vapor_pressure_deficit",
     "saz": "Science/SAz",
     "sza": "Science/SZA",
@@ -41,6 +41,7 @@ OCO3_VARIABLES: dict[str, str] = {
     "vaz": "Science/vaa",
     "vza": "Science/vza"
 }
+"""
 
 
 def solar_zenith_angle(
@@ -142,6 +143,8 @@ def vectorize_dt(dt: xr.DataTree, data_day: datetime, compute_sza: bool = False)
     lon = np.asarray(dt[OCO3_VARIABLES["longitude"]].data)
     sif740 = np.asarray(dt[OCO3_VARIABLES["sif740"]].data)
     sza = np.asarray(dt[OCO3_VARIABLES["sza"]].data)
+    tair = np.asarray(dt[OCO3_VARIABLES["tair"]].data)
+    vpd = np.asarray(dt[OCO3_VARIABLES["vpd"]].data)
 
     expected_shape = (len(hr), len(lon), len(lat))
     if sif740.shape != expected_shape:
@@ -169,7 +172,9 @@ def vectorize_dt(dt: xr.DataTree, data_day: datetime, compute_sza: bool = False)
             lon[lon_ndx],
             lat[lat_ndx],
             sif740[hr_ndx, lon_ndx, lat_ndx],
-            sza[hr_ndx, lon_ndx, lat_ndx]
+            sza[hr_ndx, lon_ndx, lat_ndx],
+            tair[hr_ndx, lon_ndx, lat_ndx],
+            vpd[hr_ndx, lon_ndx, lat_ndx]
         ])
     return vectorized_data
 
@@ -184,11 +189,12 @@ def process_1day_matrix(
     if compute_sza:
         ndim = 7
     else:
-        ndim = 6
+        ndim = 8
     year = data_day.year
     month = f"{int(data_day.month):02d}"
     day = f"{int(data_day.day):02d}"
     if is_1deg:
+        #granule_wildcard = os.path.join(data_dir, f"{year}/{month}/oco3_goessif_{year}{month}{day}_ndgl_*.nc4")
         granule_wildcard = os.path.join(data_dir, f"{year}/{month}/oco3_goessif_{year}{month}{day}_ndgl_*.nc4")
     else:
         granule_wildcard = os.path.join(data_dir, f"oco3_geossif_0p01d_{year}{month}{day}_ndgl_*.nc4")
@@ -252,6 +258,11 @@ def sample_igbp(df: pd.DataFrame) -> None:
     secondary_mask = secondary_class != 0
     df.loc[valid_indices[secondary_mask], "IGBP_Secondary"] = secondary_class[secondary_mask]
     df.loc[valid_indices[~secondary_mask], "IGBP_Secondary"] = primary_class[~secondary_mask]
+
+    # Reduce number of biome classes similar to Zhang et al., 2023
+    remap_dict = {3: 1, 5: 4, 8: 9, 6: 7, 14: 12}
+    df["IGBP_Primary"] = df["IGBP_Primary"].replace(remap_dict)
+    df["IGBP_Secondary"] = df["IGBP_Secondary"].replace(remap_dict)
 
 
 
@@ -528,21 +539,23 @@ def download_goes_par(
         
         
 def main() -> int:
-    is_1deg = False
+    is_1deg = True
     compute_sza = False
     if is_1deg:
-        data_dir = "oco3_1p00d/ndgl/1p00d/"
+        # data_dir = "oco3_1p00d/ndgl/1p00d/"
+        data_dir = "oco3_3/ndgl/0p01deg/"
     else:
         data_dir = "oco3_0p01d/ndgl/0p01d/"
     engine = "netcdf4"
-    year = 2020
+    year = 2021
     month = 6
     if is_1deg:
-        output_csv = f"oco3_1p00d_{year}{month:02d}_sif_lc.csv"
+        #output_csv = f"oco3_1p00d_{year}{month:02d}_sif_lc.csv"
+        output_csv = f"new_oco3_0p01d_{year}{month:02d}_sif_lc.csv"
     else:
         output_csv = f"oco3_0p01d_{year}{month:02d}_sif_lc.csv"
-    download_brdfs = False
-    download_par = False
+    download_brdfs = True
+    download_par = True
     start_date = datetime(year, month, 1)
     _, num_days = calendar.monthrange(year, month)
     end_date = datetime(year, month, num_days)
@@ -555,7 +568,7 @@ def main() -> int:
             all_tiles.extend(find_geonex_tiles(daily_data[-1], date))
     combined_data = np.hstack(daily_data)
     data_transposed = combined_data.T
-    columns = ["date", "hour", "longitude", "latitude", "sif_740nm", "SZA"]
+    columns = ["date", "hour", "longitude", "latitude", "sif_740nm", "SZA", "Tair", "VPD"]
     if compute_sza:
         columns.append("comp_SZA")
     df = pd.DataFrame(data_transposed, columns=columns)
