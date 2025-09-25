@@ -236,12 +236,12 @@ def find_geonex_tiles(vectorized_data: npt.NDArray[np.float32], date: datetime) 
     return [(tile, date) for tile in uniq_tiles]
 
 
-def sample_igbp(df: pd.DataFrame) -> None:
+def sample_igbp(df: pd.DataFrame, year: int) -> None:
     df["IGBP_Primary"] = np.nan
     df["IGBP_Secondary"] = np.nan
 
-    igbp_file = "conus/modis/MCD12Q1.061_500m_aid0001_2020_CONUS_0p01deg.nc4"
-    # igbp_file = "conus/viirs/VIIRS-AST-IGBP17-GEO_v1r0_2020_CONUS_0p01deg.nc4"
+    igbp_file = f"conus/modis/MCD12Q1.061_500m_aid0001_{year}_CONUS_0p01deg.nc4"
+    # igbp_file = f"conus/viirs/VIIRS-AST-IGBP17-GEO_v1r0_{year}_CONUS_0p01deg.nc4"
     dt = open_oco3(igbp_file)
     surface_type = np.asarray(dt["IGBP17/surface_type"].data)
     ul_lat = 20
@@ -554,8 +554,8 @@ def main() -> int:
         output_csv = f"new_oco3_0p01d_{year}{month:02d}_sif_lc.csv"
     else:
         output_csv = f"oco3_0p01d_{year}{month:02d}_sif_lc.csv"
-    download_brdfs = True
-    download_par = True
+    download_brdfs = False
+    download_par = False
     start_date = datetime(year, month, 1)
     _, num_days = calendar.monthrange(year, month)
     end_date = datetime(year, month, num_days)
@@ -572,7 +572,7 @@ def main() -> int:
     if compute_sza:
         columns.append("comp_SZA")
     df = pd.DataFrame(data_transposed, columns=columns)
-    sample_igbp(df)
+    sample_igbp(df, year)
     df.to_csv(output_csv, index=False)
 
     # print("All tiles to download:")
