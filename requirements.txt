@@ -8,6 +8,7 @@ numpy
 pandas
 pillow
 pyhdf
+rasterio
 requests
 scipy
 tqdm
