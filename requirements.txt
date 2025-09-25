@@ -4,6 +4,7 @@ cartopy
 h5py
 matplotlib
 netcdf4
+numba
 numpy
 pandas
 pillow

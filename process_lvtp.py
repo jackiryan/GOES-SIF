@@ -2,7 +2,7 @@ from datetime import datetime
 import glob
 import numpy as np
 import numpy.typing as npt
-from pathlib import Path
+import os
 import rasterio
 from rasterio.transform import from_bounds
 from rasterio.crs import CRS
@@ -183,8 +183,10 @@ def process_lvtp_files(
     dem_lat_vals = 50 - np.arange(3000) * 0.01
     dem_lon, dem_lat = np.meshgrid(dem_lon_vals, dem_lat_vals)
 
+    file_paths = [file_paths[0]]
+
     for i, file_path in enumerate(file_paths):
-        print(f"Processing file {i+1}/{len(file_paths)}: {Path(file_path).name}")
+        print(f"Processing file {i+1}/{len(file_paths)}: {os.path.basename(file_path)}")
         
         # Load GOES data
         ds = xr.open_dataset(file_path)
@@ -378,7 +380,9 @@ def main():
     print(f"Found {len(file_paths)} files for {target_datetime}")
     
     # Output filename
-    output_path = f"{output_dir}/surface_temp_{target_datetime.strftime('%Y%m%d_%H')}00.tif"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"surface_temp_{target_datetime.strftime('%Y%m%d_%H')}00.tif")
     
     # Process files
     process_lvtp_files(
@@ -391,9 +395,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
