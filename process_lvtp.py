@@ -1,15 +1,19 @@
 from datetime import datetime
 import glob
+from numba import jit, prange
 import numpy as np
 import numpy.typing as npt
 import os
+from pyresample import create_area_def
+from pyresample.kd_tree import resample_nearest
+from pyresample.geometry import AreaDefinition
 import rasterio
 from rasterio.transform import from_bounds
 from rasterio.crs import CRS
-from scipy.interpolate import griddata, interp1d
-from tqdm import tqdm
+import warnings
 import xarray as xr
 
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # Constants for standard atmosphere
 P0_SEA_LEVEL = 1013.25  # hPa
@@ -17,53 +21,6 @@ T0_SEA_LEVEL = 288.15   # K (15°C)
 LAPSE_RATE = -0.0065    # K/m
 g = 9.80665             # m/s²
 R = 287.05              # J/(kg·K)
-
-
-def calculate_latlon_grid(goes_ds: xr.Dataset) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
-    """
-    Convert GOES-ABI fixed grid projection x/y coordinates to lat/lon coordinates.
-    This method is derived from the code example here created by the NOAA/NESDIS/STAR Science Team: 
-    https://www.star.nesdis.noaa.gov/atmospheric-composition-training/python_abi_lat_lon.php
-
-    See also this figure: https://www.star.nesdis.noaa.gov/atmospheric-composition-training/images/satellite_data_graphics/ABI_Fixed_Grid_Coordinate_Frames.png
-    """
-    # Read GOES ABI fixed grid projection variables and constants
-    x_coords = goes_ds.x.data
-    y_coords = goes_ds.y.data
-
-    proj_info = goes_ds["goes_imager_projection"]
-    lon_origin = proj_info.longitude_of_projection_origin
-    H = proj_info.perspective_point_height + proj_info.semi_major_axis
-    r_eq = proj_info.semi_major_axis
-    r_pol = proj_info.semi_minor_axis
-
-    # Create 2D coordinate matrices based off vectors from granule
-    x_coords_2d, y_coords_2d = np.meshgrid(x_coords, y_coords)
-
-    # Equations to calculate latitude and longitude
-    lambda_0 = (lon_origin * np.pi) / 180.0
-    # a = sin²(x) + cos²(x)cos²(y) + (r_eq² / r_pol²)sin²(y)
-    a_var = \
-        np.power(np.sin(x_coords_2d), 2.0) \
-        + (np.power(np.cos(x_coords_2d), 2.0) * (np.power(np.cos(y_coords_2d), 2.0) \
-        + (((r_eq * r_eq) / (r_pol * r_pol)) * np.power(np.sin(y_coords_2d), 2.0))))
-    # b = -2Hcos(x)cos(y)
-    b_var = -2.0 * H * np.cos(x_coords_2d) * np.cos(y_coords_2d)
-    # c = H² - r_eq²
-    c_var = (H ** 2.0) - (r_eq ** 2.0)
-    # r_s = (-b - √(b² - 4ac)) / 2a, negative solution to quadratic equation
-    r_s = (-b_var - np.sqrt((b_var ** 2) - (4.0 * a_var * c_var))) / (2.0 * a_var)
-    s_x = r_s * np.cos(x_coords_2d) * np.cos(y_coords_2d)
-    s_y = -r_s * np.sin(x_coords_2d)
-    s_z = r_s * np.cos(x_coords_2d) * np.sin(y_coords_2d)
-
-    # Ignore numpy errors for sqrt of negative number; occurs for GOES-16 ABI CONUS sector data
-    np.seterr(all="ignore")
-
-    abi_lat = (180.0/np.pi)*(np.arctan(((r_eq*r_eq)/(r_pol*r_pol))*((s_z/np.sqrt(((H-s_x)*(H-s_x))+(s_y*s_y))))))
-    abi_lon = (lambda_0 - np.arctan(s_y/(H-s_x)))*(180.0/np.pi)
-
-    return abi_lat, abi_lon
 
 
 def calculate_surface_pressure(elevation: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
@@ -82,83 +39,235 @@ def calculate_surface_pressure(elevation: npt.NDArray[np.float32]) -> npt.NDArra
     return pressure
 
 
-def interpolate_temperature_to_surface(
-    temperature_profile: npt.NDArray[np.float32],
-    pressure_levels: npt.NDArray[np.float32],
-    surface_pressure: float,
-    extrapolate: bool = True
-) -> float:
-    """
-    Interpolate temperature profile to surface pressure.
-    
-    Args:
-        temperature_profile (np.ndarray): Temperature values at each pressure level (K or °C)
-        pressure_levels (np.ndarray): Pressure levels (hPa)
-        surface_pressure (float): Target surface pressure (hPa)
-        extrapolate (bool): Whether to extrapolate if surface pressure is outside range
-        
-    Returns:
-        surface_temp (float): Interpolated surface temperature
-    """
-    # Remove NaN values
-    valid_mask = ~np.isnan(temperature_profile)
-    if not np.any(valid_mask):
-        return np.nan
-    
-    valid_temps = temperature_profile[valid_mask]
-    valid_pressures = pressure_levels[valid_mask]
-    
-    # Sort by pressure (descending order for stability)
-    sort_idx = np.argsort(valid_pressures)[::-1]
-    valid_temps = valid_temps[sort_idx]
-    valid_pressures = valid_pressures[sort_idx]
-    
-    # Use log-pressure interpolation for better accuracy
-    log_pressures = np.log(valid_pressures)
-    log_surface_pressure = np.log(surface_pressure)
-    
-    if extrapolate:
-        # Allow extrapolation with "extrapolate" mode
-        interp_func = interp1d(
-            log_pressures, valid_temps,
-            kind="linear", fill_value="extrapolate" # type: ignore
-        )
-    else:
-        # Clip to bounds
-        interp_func = interp1d(
-            log_pressures, valid_temps,
-            kind="linear", bounds_error=False,
-            fill_value=(valid_temps[0], valid_temps[-1]) # type: ignore
-        )
-    
-    surface_temp = interp_func(log_surface_pressure)
-    return surface_temp
-
-
 def load_dem(
         dem_path: str,
-) -> np.ndarray:
+) -> tuple[npt.NDArray[np.float32], list[int]]:
     """
-    Load DEM and extract elevation. Since we know the bounds, resolution and CRS of this
-    file a priori, we don't need to faff about with subsetting and metadata.
+    Load DEM and extract elevation. Precompute a regular grid interpolator
+    to speed up association of elevation with GOES lat/lons.
     
     Args:
         dem_path (str): Path to DEM GeoTIFF file
         
     Returns:
-        elevation (np.ndarray): Elevation grid
+        elevation (np.ndarray): Gridded elevation values
+        extent (list[int]): extent of DEM, also will be target extent of GOES.
     """
     with rasterio.open(dem_path) as src:
         elevation = src.read(1)
+        bounds = src.bounds
+        dem_extent = [int(bounds.left), int(bounds.bottom), int(bounds.right), int(bounds.top)]
+
+    return (elevation, dem_extent)
+
+
+def combine_grids(
+        all_surface_temps: list[npt.NDArray[np.float32]],
+        all_lons: list[npt.NDArray[np.float32]],
+        all_lats: list[npt.NDArray[np.float32]]
+) -> tuple[npt.NDArray[np.float32], np.ndarray, np.ndarray]:
+    """
+    Combine grids without regridding since they're already on the same grid.
+    
+    Args:
+        all_surface_temps: List of 2D temperature arrays
+        all_lons: List of 2D longitude arrays (should all be identical)
+        all_lats: List of 2D latitude arrays (should all be identical)
+        method: How to combine overlapping values ("mean", "first", "last")
+    
+    Returns:
+        combined_grid: 2D temperature array
+        lons_1d: 1D longitude array  
+        lats_1d: 1D latitude array
+    """
+    if not all_surface_temps:
+        raise ValueError("No data to combine")
+    
+    # All grids should have the same shape and coordinates
+    ref_shape = all_surface_temps[0].shape
+    
+    # Initialize output arrays
+    combined_grid = np.zeros(ref_shape, dtype=np.float32)
+    count_grid = np.zeros(ref_shape, dtype=np.int32)
+    
+    # Sum all valid values and count them
+    for temp_grid in all_surface_temps:
+        valid_mask = ~np.isnan(temp_grid)
+        combined_grid[valid_mask] += temp_grid[valid_mask]
+        count_grid[valid_mask] += 1
+    
+    # Calculate mean where we have data
+    valid_count = count_grid > 0
+    combined_grid[valid_count] /= count_grid[valid_count]
+    combined_grid[~valid_count] = np.nan
+    
+    # Extract 1D coordinate arrays from 2D grids
+    # Assuming regular grid, take first row for lats and first column for lons
+    lons_1d = all_lons[0][0, :]  # First row (constant latitude)
+    lats_1d = all_lats[0][:, 0]  # First column (constant longitude)
+    
+    return np.flipud(combined_grid), lons_1d, lats_1d
+
+
+def resample_goes(
+        ds: xr.Dataset,
+        target_extent: list[int],
+        radius: int = 10000
+) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+    lvt_data = ds["LVT"].values  # Shape: (y, x, pressure)
+
+    proj_info = ds["goes_imager_projection"]
+    h = proj_info.perspective_point_height
+    lon_origin = proj_info.longitude_of_projection_origin
+    sweep = proj_info.sweep_angle_axis
+
+    x = ds.x.data * h
+    y = ds.y.data * h
+
+    goes_area = AreaDefinition(
+        "goes_conus",
+        "GOES East CONUS",
+        "goes_conus",
+        {
+            "proj": "geos",
+            "lon_0": lon_origin,
+            "h": h,
+            "sweep": sweep,
+            "ellps": "GRS80"
+        },
+        len(x),
+        len(y),
+        [x.min(), y.min(), x.max(), y.max()]
+    )
+
+    target_area = create_area_def(
+        "equirectangular",
+        {
+            "proj": "eqc",
+            "ellps": "WGS84"
+        },
+        area_extent=target_extent,
+        resolution=0.01,
+        units="degrees"
+    )
+
+    resampled_nn = resample_nearest(
+        goes_area,
+        lvt_data,
+        target_area,
+        radius_of_influence=radius,
+        fill_value=np.nan, # type: ignore
+        epsilon=0.5 # type: ignore
+    )
+    resampled_data = np.flipud(np.array(resampled_nn, dtype=np.float32))
+
+    lons, lats = target_area.get_lonlats() # type: ignore
+    out_lons = np.array(lons, dtype=np.float32)
+    out_lats = np.array(lats, dtype=np.float32)
+    return (resampled_data, out_lons, out_lats)
+
+
+@jit(nopython=True, parallel=True)
+def vectorized_log_interpolation(
+    temp_profiles: npt.NDArray[np.float32],  # Shape: (n_points, n_levels)
+    log_pressure_levels: npt.NDArray[np.float32],  # Shape: (n_levels,)
+    log_surface_pressures: npt.NDArray[np.float32],  # Shape: (n_points,)
+    valid_mask: npt.NDArray[np.bool_],  # Shape: (n_points, n_levels)
+) -> npt.NDArray[np.float32]:
+    """
+    Vectorized interpolation using Numba for massive speedup.
+    Performs linear interpolation in log-pressure space.
+    """
+    n_points = temp_profiles.shape[0]
+    surface_temps = np.full(n_points, np.nan, dtype=np.float32)
+    
+    for idx in prange(n_points):
+        if not np.any(valid_mask[idx]):
+            continue
+            
+        # Get valid data for this point
+        valid_temps = temp_profiles[idx, valid_mask[idx]]
+        valid_log_p = log_pressure_levels[valid_mask[idx]]
+            
+        # Sort by pressure (descending)
+        sort_indices = np.argsort(valid_log_p)[::-1]
+        valid_temps = valid_temps[sort_indices]
+        valid_log_p = valid_log_p[sort_indices]
         
-    return elevation
+        log_surf_p = log_surface_pressures[idx]
+        
+        # Linear interpolation/extrapolation
+        if log_surf_p >= valid_log_p[0]:  # Above highest pressure
+            # Extrapolate from first two points
+            if len(valid_temps) >= 2:
+                slope = (valid_temps[1] - valid_temps[0]) / (valid_log_p[1] - valid_log_p[0])
+                surface_temps[idx] = valid_temps[0] + slope * (log_surf_p - valid_log_p[0])
+            else:
+                surface_temps[idx] = valid_temps[0]
+        elif log_surf_p <= valid_log_p[-1]:  # Below lowest pressure
+            # Extrapolate from last two points
+            if len(valid_temps) >= 2:
+                slope = (valid_temps[-1] - valid_temps[-2]) / (valid_log_p[-1] - valid_log_p[-2])
+                surface_temps[idx] = valid_temps[-1] + slope * (log_surf_p - valid_log_p[-1])
+            else:
+                surface_temps[idx] = valid_temps[-1]
+        else:
+            # Interpolate between points
+            for i in range(len(valid_log_p) - 1):
+                if valid_log_p[i] >= log_surf_p >= valid_log_p[i + 1]:
+                    # Linear interpolation
+                    t = (log_surf_p - valid_log_p[i]) / (valid_log_p[i + 1] - valid_log_p[i])
+                    surface_temps[idx] = valid_temps[i] + t * (valid_temps[i + 1] - valid_temps[i])
+                    break
+    
+    return surface_temps
+
+
+def interpolate_temperature_batch(
+    lvt_data: npt.NDArray[np.float32],  # Shape: (y, x, pressure)
+    pressure_levels: npt.NDArray[np.float32],
+    surface_pressure: npt.NDArray[np.float32],  # Shape: (y, x)
+    valid_indices: tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]
+) -> npt.NDArray[np.float32]:
+    """
+    Optimized batch interpolation of temperature profiles to surface.
+    
+    Returns:
+        surface_temp: 2D array of surface temperatures
+    """
+    surface_temp = np.full_like(surface_pressure, np.nan)
+    
+    if len(valid_indices[0]) == 0:
+        return surface_temp
+    
+    # Extract data for valid points only
+    temp_profiles = lvt_data[valid_indices[0], valid_indices[1], :]  # Shape: (n_points, n_levels)
+    j_indices, i_indices = valid_indices
+    surf_pressure_j = 3000 - j_indices - 1
+    surf_pressures = surface_pressure[surf_pressure_j, i_indices] # Shape: (n_points,)
+    
+    # Precompute log pressures
+    log_pressure_levels = np.log(pressure_levels.astype(np.float32))
+    log_surf_pressures = np.log(surf_pressures.astype(np.float32))
+    
+    # Create mask for valid temperature data
+    valid_mask = ~np.isnan(temp_profiles)
+    
+    # Use vectorized Numba function
+    surface_temps_1d = vectorized_log_interpolation(
+        temp_profiles, log_pressure_levels, log_surf_pressures, valid_mask
+    )
+    
+    # Put results back into 2D array
+    surface_temp[valid_indices[0], valid_indices[1]] = surface_temps_1d
+    
+    return surface_temp
 
 
 def process_lvtp_files(
     file_paths: list[str],
     dem_path: str,
-    output_path: str,
-    quality_threshold: float = 0.0
+    output_path: str
 ) -> None:
     """
     Process multiple GOES LVTP files to create surface temperature GeoTIFF.
@@ -167,7 +276,6 @@ def process_lvtp_files(
         file_paths (list[str]): List of GOES LVTP NetCDF file paths
         dem_path (str): Path to DEM GeoTIFF
         output_path (str): Output GeoTIFF path
-        quality_threshold (float): DQF threshold (0=best quality)
     """
     print(f"Processing {len(file_paths)} GOES LVTP files...")
     
@@ -177,134 +285,46 @@ def process_lvtp_files(
     all_lats = []
 
     # Load DEM and keep it in memory
-    print("Loading DEM...")
-    dem_elev = load_dem(dem_path)
-    dem_lon_vals = -135 + np.arange(8500) * 0.01
-    dem_lat_vals = 50 - np.arange(3000) * 0.01
-    dem_lon, dem_lat = np.meshgrid(dem_lon_vals, dem_lat_vals)
-
-    file_paths = [file_paths[0]]
+    elevation, extent = load_dem(dem_path)
+    surface_pressure = calculate_surface_pressure(elevation)
 
     for i, file_path in enumerate(file_paths):
         print(f"Processing file {i+1}/{len(file_paths)}: {os.path.basename(file_path)}")
         
         # Load GOES data
         ds = xr.open_dataset(file_path)
-        
         # Get temperature data and pressure levels
-        lvt_data = ds["LVT"].values  # Shape: (y, x, pressure)
         pressure_levels = ds["pressure"].values  # Shape: (pressure,)
-        
-        # Get quality flags
-        dqf_overall = ds["DQF_Overall"].values
-        
-        # Calculate lat/lon for GOES grid
-        goes_lat, goes_lon = calculate_latlon_grid(ds)
-        
-        # Get valid data bounds
-        valid_mask = ~np.isnan(goes_lat) & ~np.isnan(goes_lon)
-        
-        # Apply quality flag filter
-        if quality_threshold is not None:
-            quality_mask = dqf_overall <= quality_threshold
-            valid_mask = valid_mask & quality_mask
-        
-        # Get extent for DEM loading
-        valid_lats = goes_lat[valid_mask]
-        valid_lons = goes_lon[valid_mask]
-        
-        if len(valid_lats) == 0:
-            print(f"  No valid data in file, skipping...")
-            continue
-        
-        # Interpolate DEM to GOES grid points
-        dem_points = np.column_stack([dem_lon.ravel(), dem_lat.ravel()])
-        goes_points = np.column_stack([goes_lon.ravel(), goes_lat.ravel()])
-        
-        print("griddata")
-        elevation_at_goes = griddata(
-            dem_points,
-            dem_elev.ravel(),
-            goes_points,
-            method="linear"
-        ).reshape(goes_lat.shape)
-        
-        # Calculate surface pressure at each GOES pixel
-        print("Calculating surface pressure...")
-        surface_pressure = calculate_surface_pressure(elevation_at_goes)
-        
-        # Initialize surface temperature array
-        surface_temp = np.full_like(goes_lat, np.nan)
-        
-        # Interpolate temperature to surface for each valid pixel
-        ny, nx = goes_lat.shape
-        print("interpolating temperature to surface...")
-        for j in tqdm(range(ny)):
-            for i in range(nx):
-                if valid_mask[j, i] and not np.isnan(surface_pressure[j, i]):
-                    temp_profile = lvt_data[j, i, :]
-                    
-                    # Check if we have valid temperature data
-                    if not np.all(np.isnan(temp_profile)):
-                        surface_temp[j, i] = interpolate_temperature_to_surface(
-                            temp_profile,
-                            pressure_levels,
-                            surface_pressure[j, i],
-                            extrapolate=True
-                        )
-        
+        lvt_resamp, goes_lon, goes_lat = resample_goes(ds, extent)
+        ds.close()
+
+        valid_mask = ~np.isnan(lvt_resamp[:, :, 0]) & ~np.isnan(surface_pressure)
+        valid_indices = np.where(valid_mask)
+
+        surface_temp = interpolate_temperature_batch(
+            lvt_resamp,
+            pressure_levels,
+            surface_pressure,
+            valid_indices # type: ignore
+        )
+
         # Store results
         all_surface_temps.append(surface_temp)
         all_lons.append(goes_lon)
         all_lats.append(goes_lat)
-        
-        ds.close()
     
-    print("Combining and regridding all data...")
+
+    print("Combining all data...")
+    surface_temp_grid, output_lons, output_lats = combine_grids(
+        all_surface_temps, all_lons, all_lats
+    )
     
-    # Combine all data
-    combined_temps = []
-    combined_lons = []
-    combined_lats = []
-    
-    for temps, lons, lats in zip(all_surface_temps, all_lons, all_lats):
-        valid = ~np.isnan(temps)
-        combined_temps.extend(temps[valid])
-        combined_lons.extend(lons[valid])
-        combined_lats.extend(lats[valid])
-    
-    combined_temps = np.array(combined_temps)
-    combined_lons = np.array(combined_lons)
-    combined_lats = np.array(combined_lats)
-    
-    # Define output grid (0.01 degree resolution)
-    output_res = 0.01
-    min_lon, max_lon = np.min(combined_lons), np.max(combined_lons)
-    min_lat, max_lat = np.min(combined_lats), np.max(combined_lats)
-    
-    output_lons = np.arange(min_lon, max_lon + output_res, output_res)
-    output_lats = np.arange(min_lat, max_lat + output_res, output_res)
-    output_lon_grid, output_lat_grid = np.meshgrid(output_lons, output_lats)
-    
-    # Interpolate to regular grid
-    points = np.column_stack([combined_lons, combined_lats])
-    output_points = np.column_stack([output_lon_grid.ravel(), output_lat_grid.ravel()])
-    
-    surface_temp_grid = griddata(
-        points,
-        combined_temps,
-        output_points,
-        method="linear"
-    ).reshape(output_lon_grid.shape)
-    
-    # Write to GeoTIFF
     write_geotiff(
         surface_temp_grid,
         output_lons,
         output_lats,
         output_path
     )
-    
     print(f"Surface temperature GeoTIFF saved to: {output_path}")
 
 
@@ -388,11 +408,15 @@ def main():
     process_lvtp_files(
         file_paths,
         dem_path,
-        output_path,
-        quality_threshold=0.0  # Use only best quality data
+        output_path
     )
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
 
