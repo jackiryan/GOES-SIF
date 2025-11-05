@@ -11,6 +11,9 @@ pillow
 pyhdf
 rasterio
 requests
+scikit-learn
 scipy
+shap
 tqdm
 xarray
+xgboost
