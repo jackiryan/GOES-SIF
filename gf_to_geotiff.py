@@ -13,6 +13,9 @@ Usage:
 import sys
 import os
 import argparse
+import numpy as np
+from pyhdf.SD import SD, SDC # type: ignore [import-untyped]
+from scipy import ndimage
 
 # Set GDAL plugin path for conda environment
 if 'CONDA_PREFIX' in os.environ:
@@ -36,7 +39,7 @@ def find_hdf_file(input_dir, band_num, day_of_year, year):
     Returns:
         Full path to the HDF file
     """
-    filename = f"MCD43GF_bsa_Band{band_num}_{day_of_year:03d}_{year}_V061.hdf"
+    filename = f"MCD43GF_wsa_Band{band_num}_{day_of_year:03d}_{year}_V061.hdf"
     filepath = os.path.join(input_dir, filename)
     
     if not os.path.exists(filepath):
@@ -69,7 +72,7 @@ def get_wavelength_for_band(band_num):
 
 def read_mcd43gf_band(hdf_file, band_num):
     """
-    Read albedo data from an MCD43GF HDF4 file.
+    Read albedo data from an MCD43GF HDF4 file using pyhdf.
     
     Args:
         hdf_file: Path to HDF4 file
@@ -79,28 +82,42 @@ def read_mcd43gf_band(hdf_file, band_num):
         numpy array containing the band data
     """
     wavelength = get_wavelength_for_band(band_num)
-    subdataset_name = f'HDF4_EOS:EOS_GRID:"{hdf_file}":MCD43GF_30arc_second:Albedo_Map_{wavelength}'
+    dataset_name = f"Albedo_Map_{wavelength}"
     
-    # Open the subdataset
-    subdataset = gdal.Open(subdataset_name, gdal.GA_ReadOnly)
-    if subdataset is None:
-        raise ValueError(f"Could not open subdataset for Band {band_num} in {hdf_file}")
+    # Open the HDF file
+    hdf = SD(hdf_file, SDC.READ)
     
-    # Read the data
-    band_data = subdataset.ReadAsArray()
-    subdataset = None
+    # Get list of datasets to help debug
+    datasets = hdf.datasets()
+    
+    # Try to find the dataset
+    if dataset_name not in datasets:
+        print(f"Available datasets in {os.path.basename(hdf_file)}:")
+        for ds_name in datasets.keys():
+            print(f"  - {ds_name}")
+        hdf.end()
+        raise ValueError(f"Dataset '{dataset_name}' not found in {hdf_file}")
+    
+    # Select and read the dataset
+    sds = hdf.select(dataset_name)
+    band_data = sds.get()
+    
+    # Clean up
+    sds.endaccess()
+    hdf.end()
     
     return band_data
 
 
-def downsample_array(array, target_width=8192):
+def downsample_array(array, target_width=8192, nodata_value=32767):
     """
     Downsample a 2D array to target width while preserving aspect ratio.
-    Uses averaging for downsampling to reduce aliasing.
+    Uses averaging for downsampling to reduce aliasing, properly handling NoData values.
     
     Args:
         array: Input numpy array
         target_width: Target width in pixels (default: 8192)
+        nodata_value: NoData value to exclude from averaging (default: 32767)
     
     Returns:
         Downsampled numpy array
@@ -117,11 +134,20 @@ def downsample_array(array, target_width=8192):
     print(f"  Downsampling from {input_width}x{input_height} to {target_width}x{target_height}")
     print(f"  Scale factors: X={scale_x:.2f}, Y={scale_y:.2f}")
     
+    # Count NoData pixels in input
+    nodata_count = np.sum(array == nodata_value)
+    total_pixels = array.size
+    print(f"  NoData pixels in input: {nodata_count:,} ({100*nodata_count/total_pixels:.2f}%)")
+    
     # Use GDAL for high-quality downsampling with averaging
     # Create in-memory dataset for input
     mem_driver = gdal.GetDriverByName('MEM')
     src_ds = mem_driver.Create('', input_width, input_height, 1, gdal.GDT_Float32)
-    src_ds.GetRasterBand(1).WriteArray(array)
+    src_band = src_ds.GetRasterBand(1)
+    src_band.WriteArray(array)
+    
+    # Set NoData value so GDAL excludes it from averaging
+    src_band.SetNoDataValue(float(nodata_value))
     
     # Set geotransform for source (global extent, 30 arc-second resolution)
     # Input: 43200 x 21600 pixels = 360 degrees x 180 degrees
@@ -144,6 +170,10 @@ def downsample_array(array, target_width=8192):
     
     # Create in-memory dataset for output
     dst_ds = mem_driver.Create('', target_width, target_height, 1, gdal.GDT_Float32)
+    dst_band = dst_ds.GetRasterBand(1)
+    
+    # Set NoData value for destination
+    dst_band.SetNoDataValue(float(nodata_value))
     
     # Set geotransform for destination (same extent, different resolution)
     dst_pixel_width = 360.0 / target_width
@@ -164,6 +194,7 @@ def downsample_array(array, target_width=8192):
     dst_ds.SetProjection(dst_srs.ExportToWkt())
     
     # Perform resampling with average method
+    # GDAL will automatically exclude NoData values from the averaging
     gdal.ReprojectImage(
         src_ds, dst_ds,
         src_srs.ExportToWkt(), dst_srs.ExportToWkt(),
@@ -171,7 +202,12 @@ def downsample_array(array, target_width=8192):
     )
     
     # Read the downsampled data
-    downsampled = dst_ds.GetRasterBand(1).ReadAsArray()
+    downsampled = dst_band.ReadAsArray()
+    
+    # Count NoData pixels in output
+    nodata_count_out = np.sum(downsampled == nodata_value)
+    total_pixels_out = downsampled.size
+    print(f"  NoData pixels in output: {nodata_count_out:,} ({100*nodata_count_out/total_pixels_out:.2f}%)")
     
     # Clean up
     src_ds = None
@@ -180,13 +216,84 @@ def downsample_array(array, target_width=8192):
     return downsampled
 
 
-def create_geotiff(output_file, data_arrays, projection='EPSG:4326'):
+def fill_ocean_with_blend(data_arrays, ocean_color, blend_radius=5, nodata_value=0):
+    """
+    Fill NoData (ocean) pixels with a specified color, blending smoothly from coastal data.
+    
+    Args:
+        data_arrays: List of numpy arrays (one per band) - will be modified in place
+        ocean_color: Tuple of (R, G, B) values for deep ocean (e.g., (1, 11, 20))
+        blend_radius: Radius in pixels for blending transition (default: 5)
+        nodata_value: NoData value to replace (default: 32767)
+    
+    Returns:
+        List of modified numpy arrays with ocean filled
+    """
+    from scipy import ndimage
+    
+    print(f"\nFilling ocean with color {ocean_color} and {blend_radius}-pixel blend...")
+    
+    # Create a mask of valid (non-NoData) pixels (same for all bands)
+    valid_mask = data_arrays[0] != nodata_value
+    
+    # Calculate distance from each NoData pixel to nearest valid pixel
+    # Distance transform gives distance to nearest zero (False) pixel
+    distance_from_data = ndimage.distance_transform_edt(~valid_mask)
+    
+    # Create blend weight: 1.0 at data edge, 0.0 at blend_radius distance
+    # Pixels beyond blend_radius get pure ocean color
+    blend_weight = np.clip(1.0 - (distance_from_data / blend_radius), 0.0, 1.0)
+    
+    # Process each band
+    filled_arrays = []
+    for i, (data_array, target_color) in enumerate(zip(data_arrays, ocean_color)):
+        print(f"  Processing band {i+1} (target ocean value: {target_color})...")
+        
+        # Create output array
+        filled = data_array.copy()
+        
+        # For NoData pixels, blend between nearest valid value and ocean color
+        nodata_mask = data_array == nodata_value
+        
+        if np.any(nodata_mask):
+            # Find nearest valid value for each NoData pixel using distance transform
+            # We'll use nearest neighbor interpolation for the valid data
+            indices = ndimage.distance_transform_edt(
+                ~valid_mask, 
+                return_distances=False, 
+                return_indices=True
+            )
+            
+            # Get the nearest valid values
+            nearest_valid_values = data_array[tuple(indices)]
+            
+            # Blend between nearest valid value and ocean color based on distance
+            # At the coast (distance=0): use nearest_valid_value
+            # At distance=blend_radius: use ocean_color
+            blended_values = (
+                blend_weight * nearest_valid_values + 
+                (1.0 - blend_weight) * target_color
+            )
+            
+            # Apply blended values only to NoData pixels
+            filled[nodata_mask] = blended_values[nodata_mask]
+            
+            pixels_filled = np.sum(nodata_mask)
+            print(f"    Filled {pixels_filled:,} pixels")
+        
+        filled_arrays.append(filled)
+    
+    return filled_arrays
+
+
+def create_geotiff(output_file, data_arrays, nodata_value=None, projection='EPSG:4326'):
     """
     Create a GeoTIFF file from numpy arrays with proper georeferencing.
     
     Args:
         output_file: Path to output GeoTIFF file
         data_arrays: List of numpy arrays (one per band)
+        nodata_value: NoData value to set (default: 0)
         projection: Projection string (default: EPSG:4326)
     """
     # Get dimensions from first array
@@ -243,6 +350,10 @@ def create_geotiff(output_file, data_arrays, projection='EPSG:4326'):
         if i <= len(band_descriptions):
             band.SetDescription(band_descriptions[i-1])
         
+        # Set NoData value
+        if nodata_value is not None:
+            band.SetNoDataValue(float(nodata_value))
+        
         # Set statistics for better visualization
         band.ComputeStatistics(False)
         
@@ -259,6 +370,8 @@ def create_geotiff(output_file, data_arrays, projection='EPSG:4326'):
     print(f"  Bands: {num_bands}")
     print(f"  Resolution: {pixel_width:.6f} degrees ({pixel_width*3600:.1f} arc-seconds)")
     print(f"  Projection: EPSG:4326")
+    if nodata_value is not None:
+        print(f"  NoData value: {nodata_value}")
 
 
 def main():
@@ -289,6 +402,12 @@ This will look for files:
                         help='Directory containing input HDF files (default: current directory)')
     parser.add_argument('--width', type=int, default=8192,
                         help='Output width in pixels (default: 8192, height will be half)')
+    parser.add_argument('--fill-ocean', action='store_true',
+                        help='Fill ocean (NoData) areas with color and smooth blending')
+    parser.add_argument('--ocean-color', type=str, default='1,11,20',
+                        help='RGB color for ocean as comma-separated values (default: 1,11,20)')
+    parser.add_argument('--blend-radius', type=int, default=5,
+                        help='Radius in pixels for coastal blending (default: 5)')
     
     args = parser.parse_args()
     
@@ -297,6 +416,18 @@ This will look for files:
     output_tif = args.output_tif
     input_dir = args.input_dir
     target_width = args.width
+    fill_ocean = args.fill_ocean
+    blend_radius = args.blend_radius
+    
+    # Parse ocean color
+    try:
+        ocean_color = tuple(map(float, args.ocean_color.split(',')))
+        if len(ocean_color) != 3:
+            raise ValueError("Ocean color must have exactly 3 values (R,G,B)")
+    except Exception as e:
+        print(f"Error parsing ocean color: {e}")
+        print("Use format: --ocean-color R,G,B (e.g., --ocean-color 1,11,20)")
+        sys.exit(1)
     
     # Validate inputs
     if day_of_year < 1 or day_of_year > 366:
@@ -309,6 +440,10 @@ This will look for files:
     print(f"Processing MCD43GF data for year {year}, day {day_of_year}")
     print(f"Input directory: {input_dir}")
     print(f"Target output resolution: {target_width}x{target_width//2}")
+    if fill_ocean:
+        print(f"Ocean filling: ENABLED (color: {ocean_color}, blend radius: {blend_radius} pixels)")
+    else:
+        print(f"Ocean filling: DISABLED (use --fill-ocean to enable)")
 
     gdal.UseExceptions()
     
@@ -358,11 +493,25 @@ This will look for files:
         print("Band 3 (Blue):")
         band3_downsampled = downsample_array(band3_data, target_width)
         
+        # Apply ocean filling if requested
+        if fill_ocean:
+            print("\n" + "="*60)
+            downsampled_arrays = [band1_downsampled, band4_downsampled, band3_downsampled]
+            downsampled_arrays = fill_ocean_with_blend(
+                downsampled_arrays, 
+                ocean_color, 
+                blend_radius=blend_radius
+            )
+            band1_downsampled, band4_downsampled, band3_downsampled = downsampled_arrays
+        
         # Create the GeoTIFF with bands in RGB order (Band1, Band4, Band3)
         print("\n" + "="*60)
         print("Creating GeoTIFF...")
-        create_geotiff(output_tif, [band1_downsampled, band4_downsampled, band3_downsampled])
-        
+        # If ocean is filled, don't set NoData value (all pixels have valid data)
+        if fill_ocean:
+            create_geotiff(output_tif, [band1_downsampled, band4_downsampled, band3_downsampled])
+        else:
+            create_geotiff(output_tif, [band1_downsampled, band4_downsampled, band3_downsampled], nodata_value=0)
         print("\n" + "="*60)
         print("Conversion completed successfully!")
         
